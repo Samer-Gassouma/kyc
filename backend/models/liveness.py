@@ -345,7 +345,7 @@ class LivenessSession:
             )
 
         # Store face tracking data for frontend visualization
-        self.face_bbox = (x, y, fw, fh)
+        self.face_bbox = (int(x), int(y), int(fw), int(fh))
         self.face_yaw = yaw
         self.face_pitch = pitch
         # Extract key 2D landmarks (normalised 0-1, then mapped to pixel coords)
