@@ -152,7 +152,7 @@ class LivenessSession:
         self.no_face_count = 0
         x1, y1, x2, y2, score = det
         self.face_detected = True
-        self.face_bbox = (x1, y1, x2 - x1, y2 - y1)
+        self.face_bbox = (int(x1), int(y1), int(x2 - x1), int(y2 - y1))
 
         # Landmarks for frontend overlay
         lm = _get_landmarks(enhanced, (x1, y1, x2, y2))
@@ -184,7 +184,7 @@ class LivenessSession:
             "selfie_ready": self.passed,
             "liveness_score": round(self.liveness_score, 3),
             "progress": min(100, int(self.real_frames / NEEDED_FRAMES * 100)),
-            "face_bbox": list(self.face_bbox) if self.face_bbox else None,
+            "face_bbox": [int(v) for v in self.face_bbox] if self.face_bbox else None,
             "face_landmarks": self.landmarks_2d,
         }
 
