@@ -1,3 +1,3 @@
 # Only exclude generated dependency directories
 .venv/
-backend/weights/ocr_cleaner_finetuned/model.safetensors
+weights/ocr_cleaner_finetuned/model.safetensors
