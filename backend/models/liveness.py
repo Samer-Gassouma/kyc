@@ -102,7 +102,7 @@ def create_session(session_id: str, language: str = "ar") -> dict:
     # Randomized challenge order
     import random
 
-    gestures = ["blink", "turnLeft", "turnRight", "smile"]
+    gestures = ["blink", "faceFrontLeft", "faceFrontRight", "smile"]
     random.shuffle(gestures)
     gestures = gestures[:3]  # pick 3
 
@@ -117,7 +117,7 @@ def create_session(session_id: str, language: str = "ar") -> dict:
         "client": client,
         "passed": False,
         "failed": False,
-        "instruction": "انظر إلى الكاميرا",
+        "instruction": "انظر إلى الكاميرا" if language == "ar" else "Look at the camera",
         "best_frame": None,
         "best_quality": 0.0,
         "frame_count": 0,
