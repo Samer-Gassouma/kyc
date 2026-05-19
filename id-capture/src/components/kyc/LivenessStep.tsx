@@ -81,7 +81,9 @@ function FaceTrackingOverlay({
     const mx = (lx: number) => (video.videoWidth - lx) * sx; // mirror
 
     // Draw connecting lines for each group
-    ctx.lineWidth = 1.5;
+    ctx.lineWidth = 2;
+    ctx.shadowColor = "rgba(74, 222, 128, 0.4)";
+    ctx.shadowBlur = 6;
     for (const group of LANDMARK_GROUPS) {
       if (group[0] >= landmarks.length) continue;
       ctx.beginPath();
@@ -92,15 +94,16 @@ function FaceTrackingOverlay({
         const lm = landmarks[group[i]];
         ctx.lineTo(mx(lm.x), lm.y * sy);
       }
-      ctx.strokeStyle = "rgba(74, 222, 128, 0.6)";
+      ctx.strokeStyle = "rgba(74, 222, 128, 0.8)";
       ctx.stroke();
     }
+    ctx.shadowBlur = 0;
 
     // Draw landmark dots
     for (const lm of landmarks) {
       ctx.beginPath();
-      ctx.arc(mx(lm.x), lm.y * sy, 1.8, 0, Math.PI * 2);
-      ctx.fillStyle = "rgba(147, 197, 253, 0.9)";
+      ctx.arc(mx(lm.x), lm.y * sy, 2.5, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(147, 197, 253, 0.95)";
       ctx.fill();
     }
   }, [landmarks, bbox, visible, canvasRef, videoRef]);

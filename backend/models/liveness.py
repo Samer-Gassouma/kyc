@@ -118,6 +118,7 @@ class LivenessSession:
         self.face_confirm_needed = 12  # frames with stable face before starting
         # Phase 2: liveness verification
         self.real_frames = 0
+        self.landmark_history: list = []  # last 3 frames for smoothing
         self.best_frame: np.ndarray | None = None
         self.best_quality = 0.0
         self.selfie_path: str | None = None
