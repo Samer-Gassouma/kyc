@@ -15,7 +15,7 @@ import cv2, numpy as np, onnxruntime as ort
 
 logger = logging.getLogger(__name__)
 _MODEL_DIR = Path(__file__).parent.parent.parent / "id-capture" / "public" / "models"
-MIN_FACE_SCORE = 0.6    # relaxed for low light
+MIN_FACE_SCORE = 0.7    # relaxed for low light
 LIVENESS_SCORE_MIN = 0.5  # relaxed for low light
 NEEDED_FRAMES = 12        # faster pass
 TIMEOUT_SEC = 45           # longer timeout
@@ -115,7 +115,7 @@ class LivenessSession:
         # Phase 1: face presence confirmation
         self.face_presence_count = 0
         self.face_confirmed = False
-        self.face_confirm_needed = 8  # frames with stable face before starting
+        self.face_confirm_needed = 12  # frames with stable face before starting
         # Phase 2: liveness verification
         self.real_frames = 0
         self.best_frame: np.ndarray | None = None
@@ -158,7 +158,7 @@ class LivenessSession:
                 lx, ly, lfw, lfh = self.last_bbox
                 lcx, lcy = lx + lfw // 2, ly + lfh // 2
                 jump = abs(cx - lcx) / max(fw, 1) + abs(cy - lcy) / max(fh, 1)
-                if jump < 0.3:  # stable
+                if jump < 0.15:  # stable
                     self.face_presence_count += 1
                 else:
                     self.face_presence_count = max(0, self.face_presence_count - 1)
