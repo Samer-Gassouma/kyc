@@ -18,7 +18,7 @@ export default function LivenessPage() {
 
   useEffect(() => {
     const sid = `liveness_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-    setSessionId(sid);
+    requestAnimationFrame(() => setSessionId(sid));
 
     fetch(`${API_BASE}/api/auth/token`, {
       method: "POST",

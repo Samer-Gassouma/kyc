@@ -40,8 +40,7 @@ export function useAutoCapture(
     if (!readyToCapture) {
       // Reset hold
       holdStartRef.current = null;
-      setIsHolding(false);
-      setHoldProgress(0);
+      requestAnimationFrame(() => { setIsHolding(false); setHoldProgress(0); });
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       return;
     }

@@ -270,12 +270,7 @@ export default function IDCaptureStep({
     );
   }
 
-  // Video natural size for bbox mapping
-  const videoEl = videoRef.current;
-  const videoSize =
-    videoEl && videoEl.videoWidth > 0
-      ? { w: videoEl.videoWidth, h: videoEl.videoHeight }
-      : undefined;
+  // Video natural size set via onLoadedMetadata callback on the <video> element
 
   // ── Camera phase ───────────────────────────────────────────────
   return (
@@ -304,6 +299,10 @@ export default function IDCaptureStep({
           playsInline
           muted
           className="h-full w-full object-cover"
+          onLoadedMetadata={(e) => {
+            const v = e.currentTarget;
+            if (v.videoWidth > 0) setVideoSize({ w: v.videoWidth, h: v.videoHeight });
+          }}
         />
 
         <CameraOverlay

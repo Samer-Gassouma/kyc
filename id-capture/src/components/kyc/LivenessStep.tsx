@@ -64,6 +64,8 @@ export default function LivenessStep({
   const [finalizing, setFinalizing] = useState(false);
   const [camError, setCamError] = useState<string | null>(null);
   const [selfieUrl, setSelfieUrl] = useState<string | null>(null);
+  const [progress, setProgress] = useState(0);
+  const [progressNeeded, setProgressNeeded] = useState(2);
   const livenessStateRef = useRef(livenessState);
 
   const startFrameLoop = (
@@ -253,6 +255,7 @@ export default function LivenessStep({
       case "passed":
         return "border-green-400 bg-green-500/10";
       case "failed":
+        return "border-red-400 bg-red-500/10";
       case "spoof":
         return "border-red-400 bg-red-500/10";
       case "running":
