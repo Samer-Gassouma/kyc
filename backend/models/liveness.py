@@ -1,8 +1,9 @@
 """
-Passive ONNX liveness — no gestures, just look at camera for 1.5s.
+Passive ONNX liveness — works in low light, shitty cameras.
 
-Face detection: OpenCV DNN RetinaFace
-Liveness: Faceplugin fr_liveness.onnx (score > 0.3 = real)
+Auto-brightness + CLAHE on every frame.
+RetinaFace DNN → Haar cascade fallback for face detection.
+Faceplugin fr_liveness.onnx for real/fake check.
 """
 
 from __future__ import annotations
@@ -14,28 +15,43 @@ import cv2, numpy as np, onnxruntime as ort
 
 logger = logging.getLogger(__name__)
 _MODEL_DIR = Path(__file__).parent.parent.parent / "id-capture" / "public" / "models"
-MIN_FACE_SCORE = 0.5
-LIVENESS_SCORE_MIN = 0.3
-NEEDED_FRAMES = 15
+MIN_FACE_SCORE = 0.35    # relaxed for low light
+LIVENESS_SCORE_MIN = 0.2  # relaxed for low light
+NEEDED_FRAMES = 12        # faster pass
+TIMEOUT_SEC = 45           # longer timeout
 
 _sessions_cache: dict[str, ort.InferenceSession] = {}
+_haar_cascade: Any = None
+
+def _enhance(frame: np.ndarray) -> np.ndarray:
+    """Auto-brightness + CLAHE — makes low-light frames usable."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    # Auto brightness: scale so mean ≈ 127
+    mean_val = gray.mean()
+    if mean_val < 60 or mean_val > 190:
+        alpha = 127.0 / max(mean_val, 1.0)
+        frame = cv2.convertScaleAbs(frame, alpha=min(alpha, 2.5), beta=0)
+    # CLAHE on L channel of LAB for contrast
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
 
 def _get_session(name: str) -> ort.InferenceSession:
     if name not in _sessions_cache:
         path = _MODEL_DIR / f"{name}.onnx"
         _sessions_cache[name] = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
-        logger.info("ONNX %s loaded", name)
     return _sessions_cache[name]
 
 _dnn_face_net: Any = None
 
-def _detect_face(frame: np.ndarray) -> tuple | None:
+def _detect_face_dnn(frame: np.ndarray) -> tuple | None:
     global _dnn_face_net
     h, w = frame.shape[:2]
     if _dnn_face_net is None:
         v = Path(__file__).parent.parent / "vendor" / "silent_antispoofing" / "resources" / "detection_model"
         _dnn_face_net = cv2.dnn.readNetFromCaffe(str(v / "deploy.prototxt"), str(v / "Widerface-RetinaFace.caffemodel"))
-        logger.info("RetinaFace DNN loaded")
     blob = cv2.dnn.blobFromImage(frame, 1.0, (320, 240), (104, 117, 123))
     _dnn_face_net.setInput(blob)
     dets = _dnn_face_net.forward()
@@ -48,6 +64,25 @@ def _detect_face(frame: np.ndarray) -> tuple | None:
     if best_score < MIN_FACE_SCORE or best_box is None:
         return None
     return (*best_box, best_score)
+
+def _detect_face_haar(frame: np.ndarray) -> tuple | None:
+    global _haar_cascade
+    h, w = frame.shape[:2]
+    if _haar_cascade is None:
+        _haar_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = _haar_cascade.detectMultiScale(gray, 1.05, 4, minSize=(40, 40))
+    if len(faces) == 0:
+        return None
+    x, y, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+    return (x, y, x + fw, y + fh, 0.6)
+
+def _detect_face(frame: np.ndarray) -> tuple | None:
+    """Two-stage detection: DNN first, Haar fallback."""
+    result = _detect_face_dnn(frame)
+    if result is not None:
+        return result
+    return _detect_face_haar(frame)
 
 def _check_liveness(frame: np.ndarray, bbox: tuple) -> float:
     sess = _get_session("fr_liveness")
@@ -86,43 +121,60 @@ class LivenessSession:
         self.best_frame: np.ndarray | None = None
         self.best_quality = 0.0
         self.selfie_path: str | None = None
-        logger.info("Liveness session %s started", session_id)
+        self.no_face_count = 0
 
     def process(self, frame: np.ndarray) -> dict:
         if self.passed or self.failed:
             return self._response()
-        if time.time() - self.start_time > 30:
+        if time.time() - self.start_time > TIMEOUT_SEC:
             self.failed = True
-            self.instruction = "انتهت المهلة"
+            self.instruction = "انتهت المهلة — حاول مجدداً"
             return self._response()
 
-        det = _detect_face(frame)
+        # Enhance for low light
+        enhanced = _enhance(frame)
+
+        # Try detection on enhanced frame, fall back to original
+        det = _detect_face(enhanced)
+        if det is None:
+            det = _detect_face(frame)
+
         if det is None:
             self.face_detected = False
-            self.real_frames = 0
-            self.instruction = "ضع وجهك في الإطار"
+            self.no_face_count += 1
+            self.real_frames = max(0, self.real_frames - 1)
+            if self.no_face_count > 30:
+                self.instruction = "تأكد من وجود إضاءة كافية"
+            else:
+                self.instruction = "ضع وجهك في الإطار"
             return self._response()
 
+        self.no_face_count = 0
         x1, y1, x2, y2, score = det
         self.face_detected = True
         self.face_bbox = (x1, y1, x2 - x1, y2 - y1)
 
-        lm = _get_landmarks(frame, (x1, y1, x2, y2))
+        # Landmarks for frontend overlay
+        lm = _get_landmarks(enhanced, (x1, y1, x2, y2))
         if lm and len(lm) >= 20:
-            self.landmarks_2d = [{"x": round(p[0], 1), "y": round(p[1], 1)} for p in lm[:20]]
+            self.landmarks_2d = [{"x": round(p[0], 1), "y": round(p[1], 1)} for p in lm[:25]]
 
-        liveness = _check_liveness(frame, (x1, y1, x2, y2))
+        # Liveness check
+        liveness = _check_liveness(enhanced, (x1, y1, x2, y2))
         self.liveness_score = liveness
 
         if liveness >= LIVENESS_SCORE_MIN:
             self.real_frames += 1
-            self.instruction = f"استمر... ({self.real_frames}/{NEEDED_FRAMES})"
-            if self.real_frames >= NEEDED_FRAMES:
+            remaining = NEEDED_FRAMES - self.real_frames
+            if remaining <= 0:
                 self.passed = True
                 self.instruction = "تم التحقق ✔"
+            else:
+                self.instruction = f"استمر... {self.real_frames}/{NEEDED_FRAMES}"
         else:
             self.real_frames = max(0, self.real_frames - 1)
             self.instruction = "انظر مباشرة إلى الكاميرا"
+
         return self._response()
 
     def _response(self) -> dict:
