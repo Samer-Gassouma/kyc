@@ -64,12 +64,6 @@ export default function LivenessStep({
   const [finalizing, setFinalizing] = useState(false);
   const [camError, setCamError] = useState<string | null>(null);
   const [selfieUrl, setSelfieUrl] = useState<string | null>(null);
-  const [faceLandmarks] = useState<
-    { x: number; y: number }[] | null
-  >(null);
-  const [progress, setProgress] = useState(0);
-  const [progressNeeded, setProgressNeeded] = useState(2);
-  const [faceBBox] = useState<number[] | null>(null);
   const livenessStateRef = useRef(livenessState);
 
   const startFrameLoop = (
