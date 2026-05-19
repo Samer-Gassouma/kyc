@@ -41,46 +41,7 @@ type LivenessState = "connecting" | "calibrating" | "running" | "passed" | "fail
 
 
 
-function FaceTrackingOverlay({
-  landmarks, bbox, canvasRef, videoRef, visible,
-}: {
-  landmarks: { x: number; y: number }[] | null;
-  bbox: number[] | null;
-  canvasRef: React.RefObject<HTMLCanvasElement | null>;
-  videoRef: React.RefObject<HTMLVideoElement | null>;
-  visible: boolean;
-}) {
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    const video = videoRef.current;
-    if (!canvas || !video || !visible) return;
 
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    canvas.width = video.videoWidth || 640;
-    canvas.height = video.videoHeight || 480;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    if (!landmarks || landmarks.length < 48) return;
-
-    const sx = canvas.width / (video.videoWidth || 640);
-    const sy = canvas.height / (video.videoHeight || 480);
-
-    const mx = (lx: number) => (video.videoWidth - lx) * sx; // mirror
-
-    // Draw landmark dots
-    for (const lm of landmarks) {
-      ctx.beginPath();
-      ctx.arc(mx(lm.x), lm.y * sy, 2.5, 0, Math.PI * 2);
-      ctx.fillStyle = "rgba(147, 197, 253, 0.95)";
-      ctx.fill();
-    }
-  }, [landmarks, bbox, visible, canvasRef, videoRef]);
-
-  if (!visible) return null;
-  return null;
-}
 
 export default function LivenessStep({
   token,
@@ -107,7 +68,6 @@ export default function LivenessStep({
   const [progress, setProgress] = useState(0);
   const [progressNeeded, setProgressNeeded] = useState(2);
   const [faceBBox, setFaceBBox] = useState<number[] | null>(null);
-  const overlayRef = useRef<HTMLCanvasElement | null>(null);
 
   // ── Single unified effect: camera → websocket → frames → cleanup ─
   useEffect(() => {
@@ -320,19 +280,6 @@ export default function LivenessStep({
           muted
           className="h-full w-full object-cover"
           style={{ aspectRatio: "3/4", transform: "scaleX(-1)" }}
-        />
-        {/* Face tracking canvas overlay */}
-        <canvas
-          ref={overlayRef}
-          className="pointer-events-none absolute inset-0 h-full w-full"
-          style={{ transform: "scaleX(-1)" }}
-        />
-        <FaceTrackingOverlay
-          landmarks={faceLandmarks}
-          bbox={faceBBox}
-          canvasRef={overlayRef}
-          videoRef={videoRef}
-          visible={livenessState === "running" || livenessState === "calibrating"}
         />
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
           <div
