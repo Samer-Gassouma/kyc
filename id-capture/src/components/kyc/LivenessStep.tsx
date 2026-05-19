@@ -201,19 +201,23 @@ export default function LivenessStep({
             setLivenessState("running");
             if (data.passed) {
               setLivenessState("passed");
-              setFinalizing(true);
-              const fd = new FormData();
-              if (frontCaptureId) fd.append("front_capture_id", frontCaptureId);
-              fetch(`${API_BASE}/api/kyc/finalize/${sessionId}`, {
-                method: "POST",
-                headers: { Authorization: `Bearer ${token}` },
-                body: fd,
-              })
-                .then((r) => r.json())
-                .then((res) => onCompleteRef.current(res.kyc_passed))
-                .catch(() => onCompleteRef.current(false))
-                .finally(() => setFinalizing(false));
               cleanup();
+              if (frontCaptureId) {
+                setFinalizing(true);
+                const fd = new FormData();
+                fd.append("front_capture_id", frontCaptureId);
+                fetch(`${API_BASE}/api/kyc/finalize/${sessionId}`, {
+                  method: "POST",
+                  headers: { Authorization: `Bearer ${token}` },
+                  body: fd,
+                })
+                  .then((r) => r.json())
+                  .then((res) => onCompleteRef.current(res.kyc_passed))
+                  .catch(() => onCompleteRef.current(false))
+                  .finally(() => setFinalizing(false));
+              } else {
+                onCompleteRef.current(true);
+              }
               return;
             }
             if (data.failed) {
