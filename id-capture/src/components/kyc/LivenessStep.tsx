@@ -40,17 +40,6 @@ interface LivenessResponse {
 type LivenessState = "connecting" | "calibrating" | "running" | "passed" | "failed";
 
 
-// 68-point face landmark connection groups
-const LANDMARK_GROUPS: number[][] = [
-  [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16],       // jaw
-  [17,18,19,20,21],      // right eyebrow
-  [22,23,24,25,26],      // left eyebrow
-  [27,28,29,30,31,32,33,34,35],  // nose bridge + tip
-  [36,37,38,39,40,41,36], // right eye (closed)
-  [42,43,44,45,46,47,42], // left eye (closed)
-  [48,49,50,51,52,53,54,55,56,57,58,59,48], // outer mouth (closed)
-  [60,61,62,63,64,65,66,67,60], // inner mouth (closed)
-];
 
 function FaceTrackingOverlay({
   landmarks, bbox, canvasRef, videoRef, visible,
@@ -79,25 +68,6 @@ function FaceTrackingOverlay({
     const sy = canvas.height / (video.videoHeight || 480);
 
     const mx = (lx: number) => (video.videoWidth - lx) * sx; // mirror
-
-    // Draw connecting lines for each group
-    ctx.lineWidth = 2;
-    ctx.shadowColor = "rgba(74, 222, 128, 0.4)";
-    ctx.shadowBlur = 6;
-    for (const group of LANDMARK_GROUPS) {
-      if (group[0] >= landmarks.length) continue;
-      ctx.beginPath();
-      const first = landmarks[group[0]];
-      ctx.moveTo(mx(first.x), first.y * sy);
-      for (let i = 1; i < group.length; i++) {
-        if (group[i] >= landmarks.length) break;
-        const lm = landmarks[group[i]];
-        ctx.lineTo(mx(lm.x), lm.y * sy);
-      }
-      ctx.strokeStyle = "rgba(74, 222, 128, 0.8)";
-      ctx.stroke();
-    }
-    ctx.shadowBlur = 0;
 
     // Draw landmark dots
     for (const lm of landmarks) {
