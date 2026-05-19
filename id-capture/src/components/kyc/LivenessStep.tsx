@@ -53,6 +53,8 @@ export default function LivenessStep({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const livenessStateRef = useRef(livenessState);
+  livenessStateRef.current = livenessState;
   const animRef = useRef<number | null>(null);
   const onCompleteRef = useRef(onComplete);
   onCompleteRef.current = onComplete;
@@ -121,13 +123,21 @@ export default function LivenessStep({
         wsRef.current = ws;
 
         ws.onopen = () => {
-          if (stopped) {
-            ws.close();
-            return;
-          }
+          if (stopped) { ws.close(); return; }
           setLivenessState("running");
           setInstruction("انظر إلى الكاميرا");
           startFrameLoop(video!, canvas, ws);
+        };
+
+        ws.onclose = () => {
+          if (!stopped) {
+            if (livenessStateRef.current === "connecting") {
+              setCamError("Camera failed to initialize");
+              setLivenessState("failed");
+            } else if (livenessStateRef.current === "running") {
+              setInstruction("انقطع الاتصال");
+            }
+          }
         };
 
         ws.onmessage = (event) => {
@@ -174,15 +184,12 @@ export default function LivenessStep({
         };
 
         ws.onerror = () => setInstruction("خطأ في الاتصال");
-        ws.onclose = () => {
-          if (!stopped && livenessState === "running")
-            setInstruction("انقطع الاتصال");
-        };
       } catch (err) {
         if (!stopped) {
-          setCamError(
-            err instanceof Error ? err.message : "Camera access denied",
-          );
+          const msg = err instanceof Error ? err.message : "Camera access denied";
+          setCamError(msg);
+          setInstruction("تعذر الوصول إلى الكاميرا");
+          setLivenessState("failed");
         }
       }
     };
