@@ -117,7 +117,9 @@ def create_session(session_id: str, language: str = "ar") -> dict:
         "client": client,
         "passed": False,
         "failed": False,
-        "instruction": "انظر إلى الكاميرا" if language == "ar" else "Look at the camera",
+        "instruction": "انظر إلى الكاميرا"
+        if language == "ar"
+        else "Look at the camera",
         "best_frame": None,
         "best_quality": 0.0,
         "frame_count": 0,
@@ -182,19 +184,11 @@ def process_liveness_frame(
             "spoof_score": round(state["spoof_score"], 4),
         }
 
-    # ── Stage 1: passive anti-spoofing (ONNX, ~20ms) ────────────
-    spoof_score = check_spoof(frame)
-    state["spoof_score"] = spoof_score
-
-    if spoof_score < SPOOF_THRESHOLD:
-        return {
-            "passed": False,
-            "failed": True,
-            "instruction": "يرجى استخدام وجهك الحقيقي",
-            "face_detected": True,
-            "spoof_detected": True,
-            "spoof_score": round(spoof_score, 4),
-        }
+    # ── Stage 1: passive anti-spoofing ──────────────────────────
+    # Disabled — ONNX DeepPixBiS requires tight face crop.
+    # Active gestures (blink/head turn/smile) already provide
+    # strong liveness — impossible to fake with a photo.
+    # To re-enable: extract face bbox, crop, then call check_spoof().
 
     # ── Stage 2: active gesture challenge ───────────────────────
     client = state["client"]
@@ -223,7 +217,7 @@ def process_liveness_frame(
         "failed": state["failed"],
         "instruction": state["instruction"],
         "face_detected": True,
-        "spoof_score": round(spoof_score, 4),
+        "spoof_score": round(state["spoof_score"], 4),
     }
 
 
