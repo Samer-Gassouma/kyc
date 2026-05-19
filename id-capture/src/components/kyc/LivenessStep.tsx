@@ -5,7 +5,17 @@ import { useCamera } from "@/hooks/useCamera";
 import { canvasToJpegBlob, grabFrame } from "@/lib/frameEncoder";
 import { API_BASE, getWsUrl } from "@/lib/apiBase";
 import clsx from "clsx";
-import { CheckCircle, Loader2, XCircle, Shield } from "lucide-react";
+import {
+  CheckCircle,
+  Loader2,
+  XCircle,
+  Shield,
+  Eye,
+  EyeOff,
+  ArrowLeft,
+  ArrowRight,
+  Smile,
+} from "lucide-react";
 
 interface LivenessStepProps {
   token: string;
@@ -14,35 +24,49 @@ interface LivenessStepProps {
   onComplete: (passed: boolean) => void;
 }
 
-interface LivenessFrame {
-  face_detected: boolean;
-  instruction: string;
+interface LivenessResponse {
   passed: boolean;
   failed: boolean;
-  progress?: number;
+  instruction: string;
+  face_detected?: boolean;
+  spoof_detected?: boolean;
+  spoof_score?: number;
   selfie_ready?: boolean;
 }
 
-export default function LivenessStep({ token, sessionId, frontCaptureId, onComplete }: LivenessStepProps) {
-  const { videoRef, isReady, error: camError, start, stop } = useCamera({
+type LivenessState = "connecting" | "running" | "passed" | "failed" | "spoof";
+
+export default function LivenessStep({
+  token,
+  sessionId,
+  frontCaptureId,
+  onComplete,
+}: LivenessStepProps) {
+  const {
+    videoRef,
+    isReady,
+    error: camError,
+    start,
+    stop,
+  } = useCamera({
     facingMode: "user",
-    width: 1280,
-    height: 720,
+    width: 640,
+    height: 480,
   });
 
-  const [state, setState] = useState("collecting");
-  const [progress, setProgress] = useState(0);
-  const [passed, setPassed] = useState(false);
-  const [failed, setFailed] = useState(false);
+  const [livenessState, setLivenessState] =
+    useState<LivenessState>("connecting");
+  const [instruction, setInstruction] = useState("انظر إلى الكاميرا");
   const [faceDetected, setFaceDetected] = useState(false);
-  const [instruction, setInstruction] = useState("Look at the camera");
   const [finalizing, setFinalizing] = useState(false);
+  const [spoofScore, setSpoofScore] = useState<number>(1.0);
+  const [reconnectKey, setReconnectKey] = useState(0);
 
   const wsRef = useRef<WebSocket | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const loopRef = useRef<number | null>(null);
 
-  // Start camera on mount
+  // Start camera
   useEffect(() => {
     canvasRef.current = document.createElement("canvas");
     start();
@@ -54,43 +78,50 @@ export default function LivenessStep({ token, sessionId, frontCaptureId, onCompl
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Connect WebSocket when camera is ready
+  // Connect WebSocket when camera ready
   useEffect(() => {
     if (!isReady || !sessionId) return;
 
     const wsUrl = getWsUrl(`/ws/liveness/${sessionId}`);
     const ws = new WebSocket(wsUrl);
     ws.binaryType = "arraybuffer";
+    wsRef.current = ws;
 
     ws.onopen = () => {
-      setInstruction("Look at the camera");
+      setLivenessState("running");
+      setInstruction("انظر إلى الكاميرا");
     };
 
     ws.onmessage = (event) => {
       try {
-        const data: LivenessFrame = JSON.parse(event.data);
-        setFaceDetected(data.face_detected);
-        setInstruction(data.instruction);
-        setProgress(data.progress ?? 0);
+        const data: LivenessResponse = JSON.parse(event.data);
 
-        if (data.passed) {
-          setPassed(true);
+        setFaceDetected(data.face_detected ?? true);
+        setInstruction(data.instruction);
+        if (data.spoof_score !== undefined) setSpoofScore(data.spoof_score);
+
+        if (data.spoof_detected) {
+          setLivenessState("spoof");
           ws.close();
           if (loopRef.current) cancelAnimationFrame(loopRef.current);
-          // Call finalize endpoint
+          return;
+        }
+
+        if (data.passed) {
+          setLivenessState("passed");
+          ws.close();
+          if (loopRef.current) cancelAnimationFrame(loopRef.current);
+
           setFinalizing(true);
           const formData = new FormData();
-          if (frontCaptureId) {
+          if (frontCaptureId)
             formData.append("front_capture_id", frontCaptureId);
-          }
           fetch(`${API_BASE}/api/kyc/finalize/${sessionId}`, {
             method: "POST",
-            headers: {
-              Authorization: `Bearer ${token}`,
-            },
+            headers: { Authorization: `Bearer ${token}` },
             body: formData,
           })
-            .then((res) => res.json())
+            .then((r) => r.json())
             .then((result) => {
               setFinalizing(false);
               onComplete(result.kyc_passed);
@@ -102,38 +133,31 @@ export default function LivenessStep({ token, sessionId, frontCaptureId, onCompl
         }
 
         if (data.failed) {
-          setFailed(true);
+          setLivenessState("failed");
           ws.close();
           if (loopRef.current) cancelAnimationFrame(loopRef.current);
         }
       } catch {
-        // ignore
+        // ignore parse errors
       }
     };
 
-    ws.onerror = () => {
-      setInstruction("Connection error — retrying...");
-    };
-
+    ws.onerror = () => setInstruction("خطأ في الاتصال — إعادة المحاولة...");
     ws.onclose = () => {
-      if (!passed && !failed) {
-        setInstruction("Connection closed");
-      }
+      if (livenessState === "running") setInstruction("انقطع الاتصال");
     };
-
-    wsRef.current = ws;
 
     return () => {
       ws.close();
     };
-  }, [isReady, sessionId, token, onComplete, passed, failed]);
+  }, [isReady, sessionId, token, onComplete, reconnectKey]);
 
   // Frame sending loop — 10fps
   useEffect(() => {
-    if (!isReady || passed || failed) return;
+    if (!isReady || livenessState !== "running") return;
 
     let lastSend = 0;
-    const INTERVAL = 100; // 10fps
+    const INTERVAL = 100;
 
     const loop = () => {
       const now = Date.now();
@@ -145,7 +169,7 @@ export default function LivenessStep({ token, sessionId, frontCaptureId, onCompl
       ) {
         lastSend = now;
         grabFrame(videoRef.current, canvasRef.current);
-        canvasToJpegBlob(canvasRef.current, 0.75).then((blob) => {
+        canvasToJpegBlob(canvasRef.current, 0.7).then((blob) => {
           blob.arrayBuffer().then((buf) => {
             if (wsRef.current?.readyState === WebSocket.OPEN) {
               wsRef.current.send(buf);
@@ -160,19 +184,39 @@ export default function LivenessStep({ token, sessionId, frontCaptureId, onCompl
     return () => {
       if (loopRef.current) cancelAnimationFrame(loopRef.current);
     };
-  }, [isReady, passed, failed, videoRef]);
+  }, [isReady, livenessState, videoRef]);
 
-  const getBorderColor = () => {
-    if (passed) return "border-green-400 bg-green-500/20";
-    if (failed) return "border-red-400 bg-red-500/20";
-    if (!faceDetected) return "border-white/40";
-    return "border-yellow-400";
+  // ── Gesture icon ────────────────────────────────────────────
+  const getGestureIcon = () => {
+    const txt = instruction.toLowerCase();
+    if (txt.includes("اغمض") || txt.includes("blink"))
+      return <EyeOff className="h-8 w-8 animate-pulse" />;
+    if (txt.includes("يسار") || txt.includes("left"))
+      return <ArrowLeft className="h-8 w-8 animate-bounce" />;
+    if (txt.includes("يمين") || txt.includes("right"))
+      return <ArrowRight className="h-8 w-8 animate-bounce" />;
+    if (txt.includes("ابتسم") || txt.includes("smile"))
+      return <Smile className="h-8 w-8 animate-pulse" />;
+    return <Eye className="h-8 w-8" />;
   };
 
-  const showProgress = state === "collecting" && !passed && !failed;
+  // ── Border color ────────────────────────────────────────────
+  const getBorderColor = () => {
+    switch (livenessState) {
+      case "passed":
+        return "border-green-400 bg-green-500/10";
+      case "failed":
+      case "spoof":
+        return "border-red-400 bg-red-500/10";
+      case "running":
+        return faceDetected ? "border-yellow-400" : "border-white/30";
+      default:
+        return "border-white/20";
+    }
+  };
 
   return (
-    <div className="flex flex-col items-center gap-4">
+    <div className="flex flex-col items-center gap-6">
       {/* Camera error */}
       {camError && (
         <div className="flex flex-col items-center gap-3 p-8 text-center">
@@ -186,7 +230,7 @@ export default function LivenessStep({ token, sessionId, frontCaptureId, onCompl
         </div>
       )}
 
-      {/* Video with face oval overlay */}
+      {/* Video + face oval */}
       <div
         className="relative w-full overflow-hidden rounded-2xl bg-black"
         style={{ maxWidth: 400 }}
@@ -197,80 +241,95 @@ export default function LivenessStep({ token, sessionId, frontCaptureId, onCompl
           playsInline
           muted
           className="h-full w-full object-cover"
-          style={{ aspectRatio: "3 / 4", transform: "scaleX(-1)" }}
+          style={{ aspectRatio: "3/4", transform: "scaleX(-1)" }}
         />
 
         {/* Face oval guide */}
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
           <div
             className={clsx(
-              "h-56 w-56 rounded-full border-[3px] transition-colors duration-300",
-              getBorderColor()
+              "flex h-56 w-56 items-center justify-center rounded-full border-[3px] transition-colors duration-500",
+              getBorderColor(),
             )}
           >
-            {passed && (
-              <div className="flex h-full items-center justify-center">
-                <CheckCircle className="h-16 w-16 text-green-400 animate-scaleIn" />
-              </div>
+            {livenessState === "passed" && (
+              <CheckCircle className="h-16 w-16 animate-scaleIn text-green-400" />
             )}
-            {failed && (
-              <div className="flex h-full items-center justify-center">
-                <XCircle className="h-16 w-16 text-red-400 animate-scaleIn" />
-              </div>
+            {(livenessState === "failed" || livenessState === "spoof") && (
+              <XCircle className="h-16 w-16 animate-scaleIn text-red-400" />
             )}
           </div>
         </div>
       </div>
 
-      {/* Challenge prompt */}
-      <div className="flex flex-col items-center gap-2">
-        {showProgress && (
-          <div className="flex w-full max-w-xs flex-col items-center gap-2">
-            <div className="flex items-center gap-2 text-sm font-medium text-white">
-              <Shield className="h-5 w-5 text-blue-400" />
+      {/* Status area */}
+      <div className="flex flex-col items-center gap-3 text-center">
+        {/* Running: show instruction + gesture icon */}
+        {livenessState === "running" && (
+          <>
+            <div className="flex items-center gap-2 text-lg font-medium text-white">
+              {getGestureIcon()}
               <span>{instruction}</span>
             </div>
-            <div className="h-2 w-full overflow-hidden rounded-full bg-zinc-700">
-              <div
-                className="h-full rounded-full bg-blue-500 transition-all duration-300"
-                style={{ width: `${Math.min(100, progress)}%` }}
-              />
+            {!faceDetected && (
+              <p className="text-xs text-yellow-500">
+                وجهك غير ظاهر — انظر إلى الكاميرا
+              </p>
+            )}
+          </>
+        )}
+
+        {/* Spoof detected */}
+        {livenessState === "spoof" && (
+          <>
+            <div className="flex items-center gap-2 rounded-full bg-red-600 px-5 py-2.5 text-sm font-medium text-white">
+              <Shield className="h-5 w-5" />
+              <span>تم اكتشاف محاولة احتيال</span>
             </div>
-            <span className="text-xs text-zinc-400">
-              {Math.min(100, progress)}%
-            </span>
-          </div>
+            <p className="text-sm text-zinc-400">{instruction}</p>
+          </>
         )}
 
-        {passed && (
-          <div className="flex items-center gap-2 rounded-full bg-green-600 px-5 py-2.5 text-sm font-medium text-white">
-            <CheckCircle className="h-5 w-5" />
-            <span>Liveness passed — finalizing...</span>
-          </div>
+        {/* Passed */}
+        {livenessState === "passed" && (
+          <>
+            <div className="flex items-center gap-2 rounded-full bg-green-600 px-5 py-2.5 text-sm font-medium text-white">
+              <CheckCircle className="h-5 w-5" />
+              <span>تم التحقق — جاري التأكيد...</span>
+            </div>
+            {finalizing && (
+              <div className="flex items-center gap-2 text-sm text-zinc-400">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                <span>مطابقة الوجه...</span>
+              </div>
+            )}
+          </>
         )}
 
-        {failed && (
-          <div className="flex items-center gap-2 rounded-full bg-red-600 px-5 py-2.5 text-sm font-medium text-white">
-            <XCircle className="h-5 w-5" />
-            <span>Liveness failed — please retry</span>
-          </div>
+        {/* Failed */}
+        {(livenessState === "failed" || livenessState === "spoof") && (
+          <button
+            onClick={async () => {
+              await fetch(`${API_BASE}/api/liveness/reset/${sessionId}`, {
+                method: "POST",
+              });
+              setReconnectKey((k) => k + 1);
+              setLivenessState("running");
+              setInstruction("انظر إلى الكاميرا");
+              start();
+            }}
+            className="rounded-full bg-blue-600 px-6 py-2.5 text-sm font-medium text-white hover:bg-blue-500"
+          >
+            إعادة المحاولة
+          </button>
         )}
 
-        {finalizing && (
-          <div className="flex items-center gap-2 text-sm text-zinc-500">
+        {/* Connecting */}
+        {livenessState === "connecting" && (
+          <div className="flex items-center gap-2 text-sm text-zinc-400">
             <Loader2 className="h-4 w-4 animate-spin" />
-            <span>Running face match...</span>
+            <span>جاري الاتصال...</span>
           </div>
-        )}
-
-        <p className="text-center text-sm text-zinc-500 dark:text-zinc-400">
-          {instruction}
-        </p>
-
-        {!faceDetected && !passed && !failed && isReady && (
-          <p className="text-xs text-yellow-500">
-            No face detected — look at the camera
-          </p>
         )}
       </div>
     </div>

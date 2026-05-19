@@ -1,4 +1,4 @@
-"""WebSocket /ws/liveness/{session_id} + POST /api/kyc/finalize/{session_id}."""
+"""WebSocket /ws/liveness/{session_id} + finalize + reset endpoints."""
 
 from __future__ import annotations
 
@@ -6,14 +6,21 @@ import logging
 
 import cv2
 import numpy as np
-from fastapi import APIRouter, Depends, File, Form, HTTPException, WebSocket, WebSocketDisconnect
-
 from core.auth import get_current_user_or_api_key
 from core.db import Capture, KYCResult, LivenessSession, SessionLocal
 from core.storage import download_decrypted
+from fastapi import (
+    APIRouter,
+    Depends,
+    Form,
+    HTTPException,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from models.liveness import (
-    clear_session,
-    get_session_selfie,
+    cleanup_session,
+    create_session,
+    get_selfie_frame,
     match_faces,
     process_liveness_frame,
 )
@@ -24,25 +31,31 @@ router = APIRouter()
 
 @router.websocket("/ws/liveness/{session_id}")
 async def ws_liveness(websocket: WebSocket, session_id: str):
-    """Accept face frames for a session, run liveness challenges."""
+    """WebSocket for active liveness gesture challenges.
+
+    Frames sent from browser at ~10fps. Server runs gesture detection
+    and returns real-time instructions + final pass/fail.
+    """
     await websocket.accept()
-    logger.info("Liveness WebSocket connected: %s session=%s",
-                websocket.client, session_id)
+    logger.info("Liveness WebSocket connected session=%s", session_id)
+
+    create_session(session_id)
 
     try:
         while True:
             data = await websocket.receive_bytes()
-
             arr = np.frombuffer(data, dtype=np.uint8)
             frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
             if frame is None:
-                await websocket.send_json({
-                    "face_detected": False,
-                    "instruction": "Failed to decode frame",
-                    "passed": False,
-                    "failed": False,
-                })
+                await websocket.send_json(
+                    {
+                        "passed": False,
+                        "failed": False,
+                        "instruction": "تعذر فك ترميز الإطار",
+                        "face_detected": False,
+                    }
+                )
                 continue
 
             result = process_liveness_frame(frame, session_id)
@@ -52,16 +65,13 @@ async def ws_liveness(websocket: WebSocket, session_id: str):
                 break
 
     except WebSocketDisconnect:
-        logger.info("Liveness WebSocket disconnected: %s", websocket.client)
-    except Exception as e:
-        logger.error("Liveness WebSocket error: %s", e)
+        logger.info("Liveness WebSocket disconnected session=%s", session_id)
+    except Exception as exc:
+        logger.error("Liveness WebSocket error session=%s: %s", session_id, exc)
         try:
-            await websocket.close(code=1011, reason=str(e))
+            await websocket.close(code=1011, reason=str(exc))
         except Exception:
             pass
-    finally:
-        # Keep session data for finalize endpoint; cleanup after finalize
-        pass
 
 
 @router.post("/api/kyc/finalize/{session_id}")
@@ -73,12 +83,10 @@ async def finalize_kyc(
     """Run after liveness passed. Compare selfie vs CIN face crop."""
     db = SessionLocal()
     try:
-        # Check liveness state from in-memory sessions
-        selfie = get_session_selfie(session_id)
+        selfie = get_selfie_frame(session_id)
         if selfie is None:
             raise HTTPException(400, "Liveness not completed or selfie not captured")
 
-        # Load CIN face crop
         cin_face = None
         capture_id_for_kyc = None
 
@@ -93,10 +101,8 @@ async def finalize_kyc(
         if cin_face is None:
             raise HTTPException(400, "CIN face crop not found")
 
-        # Run face match
         match_result = match_faces(cin_face, selfie)
 
-        # Update LivenessSession if it exists
         ls = db.query(LivenessSession).filter_by(id=session_id).first()
         if ls:
             ls.liveness_passed = True
@@ -106,7 +112,6 @@ async def finalize_kyc(
             if not capture_id_for_kyc:
                 capture_id_for_kyc = ls.capture_front_id
 
-        # Save KYC result
         kyc = KYCResult(
             capture_id=capture_id_for_kyc or session_id,
             side="front",
@@ -116,8 +121,7 @@ async def finalize_kyc(
         db.add(kyc)
         db.commit()
 
-        # Cleanup in-memory session
-        clear_session(session_id)
+        cleanup_session(session_id)
 
         return {
             "session_id": session_id,
@@ -128,3 +132,11 @@ async def finalize_kyc(
         }
     finally:
         db.close()
+
+
+@router.post("/api/liveness/reset/{session_id}")
+async def reset_liveness(session_id: str) -> dict:
+    """Reset liveness session — start fresh with new random challenges."""
+    cleanup_session(session_id)
+    create_session(session_id)
+    return {"reset": True}

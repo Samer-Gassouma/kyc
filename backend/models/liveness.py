@@ -1,16 +1,18 @@
 """
-Production-grade passive liveness detection.
-Stage 1: Silent anti-spoofing (MiniFASNet dual-model fusion)
-Stage 2: 3D depth map validation (MediaPipe FaceLandmarker)
-Stage 3: Best frame capture for face matching
-No user interaction required — fully passive/silent.
+Active + passive liveness detection.
+
+Stage 1 (passive): ONNX DeepPixBiS anti-spoofing (~20ms/frame)
+  — Catches photo/video replay before gesture challenge starts.
+
+Stage 2 (active): liveness-detector gesture challenges
+  — Randomized: blink, head turn left/right, smile.
+  — Runs server-side, frames sent via WebSocket.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import sys
 import tempfile
 import time
 from pathlib import Path
@@ -18,412 +20,259 @@ from typing import Any
 
 import cv2
 import numpy as np
-import torch
-
-# ── Vendored silent anti-spoofing ─────────────────────────────
-VENDOR_PATH = Path(__file__).parent.parent / "vendor" / "silent_antispoofing"
-sys.path.insert(0, str(VENDOR_PATH))
-
-from src.anti_spoof_predict import AntiSpoofPredict, Detection
-from src.generate_patches import CropImage
-from src.utility import parse_model_name
-import mediapipe as mp
+import onnxruntime as ort
 
 logger = logging.getLogger(__name__)
 
-# ── Model paths ────────────────────────────────────────────────
-MODEL_DIR = VENDOR_PATH / "resources" / "anti_spoof_models"
+# ── Paths ──────────────────────────────────────────────────────────
+_VENDOR_DIR = Path(__file__).parent.parent / "vendor" / "face-liveness"
+_SPOOF_MODEL_PATH = (
+    _VENDOR_DIR / "data" / "checkpoints" / "OULU_Protocol_2_model_0_0.onnx"
+)
 
-ANTI_SPOOF_MODELS = [
-    "2.7_80x80_MiniFASNetV2.pth",
-    "4_0_0_80x80_MiniFASNetV1SE.pth",
-]
+# ── Thresholds ─────────────────────────────────────────────────────
+SPOOF_THRESHOLD = 0.03  # below this = spoof (photo/video replay)
+MAX_TIMEOUT_SECONDS = 45  # total time for gesture challenge
 
-# ── Thresholds ─────────────────────────────────────────────────
-SPOOF_SCORE_THRESHOLD = 0.6  # above = real face
-DEPTH_VARIANCE_MIN = 0.002   # min landmark depth variance for 3D confirmation
-MIN_CONSECUTIVE_REAL = 5     # frames that must pass before capture
-FACE_QUALITY_MIN = 40.0      # min Laplacian variance for selfie frame
-MAX_TIMEOUT_SECONDS = 30     # max time for liveness check
+# ── ONNX anti-spoofing (lazy singleton) ────────────────────────────
+_spoof_session: ort.InferenceSession | None = None
 
-# ── Lazy singletons ────────────────────────────────────────────
-_predictor: Any | None = None
-_cropper: CropImage | None = None
-_landmarker: Any | None = None
+# ImageNet normalization (same as torchvision)
+_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
-def _get_predictor():
-    global _predictor, _cropper
-    if _predictor is None:
-        logger.info("Loading MiniFASNet anti-spoofing models...")
-        # Patch Detection.__init__ to use correct absolute paths
-        _orig_detection_init = Detection.__init__
-        _orig_predict_init = AntiSpoofPredict.__init__
+def _get_spoof_model() -> ort.InferenceSession:
+    global _spoof_session
+    if _spoof_session is None:
+        if not _SPOOF_MODEL_PATH.exists():
+            _SPOOF_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+            import urllib.request
 
-        def _patched_detection_init(self):
-            deploy = str(VENDOR_PATH / "resources" / "detection_model" / "deploy.prototxt")
-            caffemodel = str(VENDOR_PATH / "resources" / "detection_model" / "Widerface-RetinaFace.caffemodel")
-            self.detector = cv2.dnn.readNetFromCaffe(deploy, caffemodel)
-            self.detector_confidence = 0.6
-
-        def _patched_predict_init(self, device_id):
-            Detection.__init__(self)
-            self.device = torch.device("cpu")
-
-        Detection.__init__ = _patched_detection_init
-        AntiSpoofPredict.__init__ = _patched_predict_init
-        try:
-            _predictor = AntiSpoofPredict(0)
-        finally:
-            Detection.__init__ = _orig_detection_init
-            AntiSpoofPredict.__init__ = _orig_predict_init
-
-        _cropper = CropImage()
-        logger.info("Anti-spoofing models loaded (CPU)")
-    return _predictor, _cropper
-
-
-def _get_landmarker():
-    global _landmarker
-    if _landmarker is None:
-        from mediapipe.tasks.python import vision, BaseOptions
-        model_path = Path(__file__).parent.parent / "weights" / "face_landmarker_v2_with_blendshapes.task"
-        options = vision.FaceLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path=str(model_path)),
-            output_face_blendshapes=False,
-            output_facial_transformation_matrixes=True,
-            num_faces=1,
-            running_mode=vision.RunningMode.IMAGE,
+            logger.info("Downloading ONNX anti-spoofing model...")
+            urllib.request.urlretrieve(
+                "https://github.com/ffletcherr/face-recognition-liveness/releases/download/v0.1/OULU_Protocol_2_model_0_0.onnx",
+                str(_SPOOF_MODEL_PATH),
+            )
+        _spoof_session = ort.InferenceSession(
+            str(_SPOOF_MODEL_PATH), providers=["CPUExecutionProvider"]
         )
-        _landmarker = vision.FaceLandmarker.create_from_options(options)
-        logger.info("MediaPipe FaceLandmarker loaded")
-    return _landmarker
+        logger.info("ONNX anti-spoofing model loaded")
+    return _spoof_session
 
 
-# ── Stage 1: Silent anti-spoofing ──────────────────────────────
-def run_anti_spoofing(frame: np.ndarray) -> dict:
-    """
-    Run dual MiniFASNet models on a single frame.
-    Returns liveness score (0-1) and real/fake decision.
-    """
-    predictor, cropper = _get_predictor()
-    h, w = frame.shape[:2]
+def check_spoof(face_crop: np.ndarray) -> float:
+    """Run DeepPixBiS anti-spoofing on a face crop.
 
-    # Detect face bbox using the built-in RetinaFace detector
-    image_bbox = predictor.get_bbox(frame)
-
-    if image_bbox is None:
-        return {
-            "face_found": False,
-            "score": 0.0,
-            "is_real": False,
-            "reason": "No face detected",
-        }
-
-    prediction = np.zeros((1, 3))
-    model_count = 0
-
-    for model_name in ANTI_SPOOF_MODELS:
-        model_path = MODEL_DIR / model_name
-        if not model_path.exists():
-            logger.warning("Model not found: %s", model_path)
-            continue
-
-        h_input, w_input, model_type, scale = parse_model_name(model_name)
-
-        param = {
-            "org_img": frame,
-            "bbox": image_bbox,
-            "scale": scale,
-            "out_w": w_input,
-            "out_h": h_input,
-            "crop": scale is not None,
-        }
-        img_cropped = cropper.crop(**param)
-        prediction += predictor.predict(img_cropped, str(model_path))
-        model_count += 1
-
-    if model_count == 0:
-        return {
-            "face_found": True,
-            "score": 0.0,
-            "is_real": False,
-            "reason": "Model inference failed",
-        }
-
-    label = int(np.argmax(prediction))
-    value = float(prediction[0][label] / model_count)
-    is_real = (label == 1) and (value > SPOOF_SCORE_THRESHOLD)
-
-    return {
-        "face_found": True,
-        "score": round(value, 4),
-        "is_real": is_real,
-        "label": label,
-        "model_count": model_count,
-        "bbox": image_bbox,
-        "reason": "Real face" if is_real else "Spoofing detected",
-    }
-
-
-# ── Stage 2: 3D depth map from MediaPipe ──────────────────────
-def run_depth_check(frame: np.ndarray) -> dict:
-    """
-    Use MediaPipe FaceLandmarker to build a 3D landmark mesh.
-    A real face has high variance in Z-depth across landmarks.
-    A flat photo has near-zero Z-depth variance.
+    Returns liveness score 0-1. Higher = more real.
+    Score < 0.03 strongly indicates a photo/video replay.
     """
     try:
-        landmarker = _get_landmarker()
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        result = landmarker.detect(mp_image)
+        sess = _get_spoof_model()
 
-        if not result.face_landmarks:
-            return {
-                "face_3d": False,
-                "depth_variance": 0.0,
-                "is_3d": False,
-                "reason": "No landmarks",
-            }
+        # Preprocess: BGR → RGB → resize 224×224 → normalize → NCHW
+        rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
+        resized = cv2.resize(rgb, (224, 224))
+        blob = resized.astype(np.float32) / 255.0
+        blob = (blob - _IMAGENET_MEAN) / _IMAGENET_STD
+        blob = np.transpose(blob, (2, 0, 1))[None]  # 1×3×224×224
 
-        landmarks = result.face_landmarks[0]
-
-        # Extract Z coordinates (depth) for all landmarks
-        z_values = np.array([lm.z for lm in landmarks])
-        depth_variance = float(np.var(z_values))
-
-        # Compute head pose from transformation matrix
-        yaw = 0.0
-        pitch = 0.0
-        if result.facial_transformation_matrixes:
-            transform = np.array(result.facial_transformation_matrixes[0].data).reshape(4, 4)
-            yaw = float(np.arctan2(transform[1, 0], transform[0, 0]) * 180 / np.pi)
-            pitch = float(
-                np.arctan2(
-                    -transform[2, 0],
-                    np.sqrt(transform[2, 1] ** 2 + transform[2, 2] ** 2),
-                )
-                * 180
-                / np.pi
-            )
-
-        is_3d = depth_variance > DEPTH_VARIANCE_MIN
-
-        return {
-            "face_3d": True,
-            "depth_variance": round(depth_variance, 6),
-            "is_3d": is_3d,
-            "landmark_count": len(landmarks),
-            "yaw": round(yaw, 1),
-            "pitch": round(pitch, 1),
-            "reason": "3D face confirmed" if is_3d else "Flat face detected",
-        }
-    except Exception as e:
-        logger.error("Depth check failed: %s", e)
-        return {
-            "face_3d": False,
-            "depth_variance": 0.0,
-            "is_3d": False,
-            "reason": str(e),
-        }
+        output_pixel, output_binary = sess.run(
+            ["output_pixel", "output_binary"],
+            {"input": blob.astype(np.float32)},
+        )
+        score = float((np.mean(output_pixel) + np.mean(output_binary)) / 2.0)
+        return score
+    except Exception as exc:
+        logger.error("Spoof check failed: %s", exc)
+        return 1.0  # fail open
 
 
-# ── Stage 3: Frame quality for selfie capture ─────────────────
-def frame_quality(frame: np.ndarray) -> float:
-    """Laplacian variance — higher = sharper."""
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+# ── Session management ─────────────────────────────────────────────
+_sessions: dict[str, dict[str, Any]] = {}
 
 
-# ── Session state ─────────────────────────────────────────────
-_sessions: dict[str, dict] = {}
+def create_session(session_id: str, language: str = "ar") -> dict:
+    """Start a new active liveness session with randomized gesture challenges."""
+    from liveness_detector.server_launcher import GestureServerClient
 
+    if session_id in _sessions:
+        cleanup_session(session_id)
 
-def reset_session(session_id: str):
-    _sessions[session_id] = {
-        "consecutive_real": 0,
-        "frame_count": 0,
-        "start_time": time.time(),
-        "best_frame": None,
-        "best_quality": 0.0,
-        "selfie_path": None,
+    # Randomized challenge order
+    import random
+
+    gestures = ["blink", "turnLeft", "turnRight", "smile"]
+    random.shuffle(gestures)
+    gestures = gestures[:3]  # pick 3
+
+    client = GestureServerClient(
+        language=language,
+        socket_path=f"/tmp/liveness_{session_id}",
+        num_gestures=3,
+        gestures_list=gestures,
+    )
+
+    state: dict[str, Any] = {
+        "client": client,
         "passed": False,
         "failed": False,
-        "fail_reason": None,
+        "instruction": "انظر إلى الكاميرا",
+        "best_frame": None,
+        "best_quality": 0.0,
+        "frame_count": 0,
+        "spoof_score": 1.0,
+        "start_time": time.time(),
+        "selfie_path": None,
     }
 
+    def on_instruction(message: str):
+        state["instruction"] = message
+        logger.info("Liveness [%s]: %s", session_id, message)
 
-def clear_session(session_id: str) -> None:
-    """Remove session data and temp selfie file."""
-    session = _sessions.pop(session_id, None)
-    if session:
-        selfie_path = session.get("selfie_path")
-        if selfie_path and os.path.exists(selfie_path):
-            try:
-                os.remove(selfie_path)
-            except OSError:
-                pass
+    def on_result(alive: bool):
+        state["passed"] = alive
+        state["failed"] = not alive
+        logger.info("Liveness result [%s]: %s", session_id, alive)
 
+    client.set_string_callback(on_instruction)
+    client.set_report_alive_callback(on_result)
+    client.start_server()
 
-def get_session_selfie(session_id: str) -> np.ndarray | None:
-    """Return the captured selfie frame for a passed session."""
-    sess = _sessions.get(session_id)
-    if not sess:
-        return None
-    # In-memory frame may be lost on uvicorn reload; fall back to temp file
-    frame = sess.get("best_frame")
-    if frame is not None:
-        return frame
-    selfie_path = sess.get("selfie_path")
-    if selfie_path and os.path.exists(selfie_path):
-        frame = cv2.imread(selfie_path)
-        if frame is not None:
-            sess["best_frame"] = frame
-            return frame
-    return None
+    _sessions[session_id] = state
+    logger.info("Liveness session %s created — gestures: %s", session_id, gestures)
+
+    return {"started": True, "session_id": session_id}
 
 
-# ── Main per-frame entry point ─────────────────────────────────
 def process_liveness_frame(
     frame: np.ndarray,
     session_id: str,
 ) -> dict[str, Any]:
-    """
-    Process one camera frame through the full passive liveness pipeline.
-    Called per WebSocket frame. Returns state + UI instructions.
+    """Process one camera frame through passive + active liveness pipeline.
+
+    Called per WebSocket frame. Returns UI state for frontend overlay.
     """
     if session_id not in _sessions:
-        reset_session(session_id)
+        create_session(session_id)
 
-    sess = _sessions[session_id]
-    sess["frame_count"] += 1
+    state = _sessions[session_id]
+    state["frame_count"] += 1
 
-    # Timeout
-    elapsed = time.time() - sess["start_time"]
-    if elapsed > MAX_TIMEOUT_SECONDS and not sess["passed"]:
-        sess["failed"] = True
-        sess["fail_reason"] = "Liveness check timed out"
+    # ── Timeout check ──────────────────────────────────────────
+    elapsed = time.time() - state["start_time"]
+    if elapsed > MAX_TIMEOUT_SECONDS and not state["passed"]:
+        state["failed"] = True
 
-    if sess["failed"]:
+    if state["failed"]:
         return {
             "passed": False,
             "failed": True,
-            "instruction": sess["fail_reason"],
-            "consecutive_real": 0,
-            "frame_count": sess["frame_count"],
-        }
-
-    if sess["passed"]:
-        return {
-            "passed": True,
-            "failed": False,
-            "instruction": "Liveness confirmed",
-            "selfie_ready": True,
-            "frame_count": sess["frame_count"],
-        }
-
-    # ── Stage 1: Anti-spoofing ─────────────────────────────────
-    spoof_result = run_anti_spoofing(frame)
-
-    if not spoof_result["face_found"]:
-        sess["consecutive_real"] = 0
-        return {
-            "passed": False,
-            "failed": False,
-            "instruction": "Position your face in the frame",
+            "instruction": "انتهت المهلة — الرجاء المحاولة مرة أخرى",
             "face_detected": False,
-            "consecutive_real": 0,
-            "frame_count": sess["frame_count"],
+            "spoof_score": round(state["spoof_score"], 4),
         }
 
-    if not spoof_result["is_real"]:
-        sess["consecutive_real"] = 0
-        return {
-            "passed": False,
-            "failed": False,
-            "instruction": "Spoofing attempt detected — please use your real face",
-            "face_detected": True,
-            "spoof_score": spoof_result["score"],
-            "consecutive_real": 0,
-            "frame_count": sess["frame_count"],
-        }
-
-    # ── Stage 2: 3D depth check ────────────────────────────────
-    depth_ok = True
-    depth_result = {}
-    if sess["frame_count"] % 3 == 0:
-        depth_result = run_depth_check(frame)
-        depth_ok = depth_result.get("is_3d", True)
-
-    if not depth_ok:
-        sess["consecutive_real"] = 0
-        return {
-            "passed": False,
-            "failed": False,
-            "instruction": "Hold your face steady and ensure good lighting",
-            "face_detected": True,
-            "spoof_score": spoof_result["score"],
-            "depth_variance": depth_result.get("depth_variance", 0),
-            "consecutive_real": 0,
-            "frame_count": sess["frame_count"],
-        }
-
-    # ── Both stages passed — track consecutive frames ──────────
-    sess["consecutive_real"] += 1
-
-    # Track best quality frame for selfie
-    quality = frame_quality(frame)
-    if quality > sess["best_quality"]:
-        sess["best_quality"] = quality
-        sess["best_frame"] = frame.copy()
-        # Persist to temp file so it survives uvicorn reloads
-        selfie_path = sess.get("selfie_path")
-        if selfie_path and os.path.exists(selfie_path):
-            try:
-                os.remove(selfie_path)
-            except OSError:
-                pass
-        fd, selfie_path = tempfile.mkstemp(suffix=".jpg", prefix="selfie_")
-        os.close(fd)
-        cv2.imwrite(selfie_path, frame)
-        sess["selfie_path"] = selfie_path
-
-    progress = min(100, int(sess["consecutive_real"] / MIN_CONSECUTIVE_REAL * 100))
-
-    if sess["consecutive_real"] >= MIN_CONSECUTIVE_REAL:
-        sess["passed"] = True
+    if state["passed"]:
         return {
             "passed": True,
             "failed": False,
-            "instruction": "Liveness confirmed",
+            "instruction": "تم التحقق",
             "selfie_ready": True,
-            "spoof_score": spoof_result["score"],
-            "progress": 100,
-            "frame_count": sess["frame_count"],
+            "spoof_score": round(state["spoof_score"], 4),
         }
+
+    # ── Stage 1: passive anti-spoofing (ONNX, ~20ms) ────────────
+    spoof_score = check_spoof(frame)
+    state["spoof_score"] = spoof_score
+
+    if spoof_score < SPOOF_THRESHOLD:
+        return {
+            "passed": False,
+            "failed": True,
+            "instruction": "يرجى استخدام وجهك الحقيقي",
+            "face_detected": True,
+            "spoof_detected": True,
+            "spoof_score": round(spoof_score, 4),
+        }
+
+    # ── Stage 2: active gesture challenge ───────────────────────
+    client = state["client"]
+    client.process_frame(frame)
+
+    # Track best frame for selfie
+    if not state["passed"]:
+        quality = _frame_quality(frame)
+        if quality > state["best_quality"]:
+            state["best_quality"] = quality
+            state["best_frame"] = frame.copy()
+            # Persist to temp file (survives uvicorn reload)
+            old = state.get("selfie_path")
+            if old and os.path.exists(old):
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
+            fd, path = tempfile.mkstemp(suffix=".jpg", prefix="selfie_")
+            os.close(fd)
+            cv2.imwrite(path, frame)
+            state["selfie_path"] = path
 
     return {
-        "passed": False,
-        "failed": False,
-        "instruction": "Hold still...",
+        "passed": state["passed"],
+        "failed": state["failed"],
+        "instruction": state["instruction"],
         "face_detected": True,
-        "spoof_score": round(spoof_result["score"], 3),
-        "consecutive_real": sess["consecutive_real"],
-        "progress": progress,
-        "depth": depth_result,
-        "frame_count": sess["frame_count"],
+        "spoof_score": round(spoof_score, 4),
     }
 
 
-# ── Face matching (unchanged from DeepFace) ─────────────────────
+def get_selfie_frame(session_id: str) -> np.ndarray | None:
+    """Return best captured selfie frame for face matching."""
+    state = _sessions.get(session_id)
+    if not state:
+        return None
+    frame = state.get("best_frame")
+    if frame is not None:
+        return frame
+    path = state.get("selfie_path")
+    if path and os.path.exists(path):
+        frame = cv2.imread(path)
+        if frame is not None:
+            state["best_frame"] = frame
+            return frame
+    return None
+
+
+def cleanup_session(session_id: str) -> None:
+    """Stop gesture server, remove temp files, clear state."""
+    state = _sessions.pop(session_id, None)
+    if state is None:
+        return
+    try:
+        state["client"].stop_server()
+    except Exception as exc:
+        logger.warning("Error stopping liveness server: %s", exc)
+    path = state.get("selfie_path")
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _frame_quality(frame: np.ndarray) -> float:
+    """Laplacian variance — higher = sharper face."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+# ── Face matching (unchanged) ──────────────────────────────────────
 def match_faces(cin_face: np.ndarray, selfie: np.ndarray) -> dict:
     """Compare CIN face crop against the captured selfie using DeepFace."""
     try:
         from deepface import DeepFace
-        import tempfile
 
-        # Write both images to temp files for DeepFace
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f1:
             cv2.imwrite(f1.name, cin_face)
             cin_path = f1.name
@@ -442,7 +291,6 @@ def match_faces(cin_face: np.ndarray, selfie: np.ndarray) -> dict:
             distance = float(result.get("distance", 1.0))
             threshold = float(result.get("threshold", 0.4))
             matched = distance < threshold
-            # Convert distance to similarity score (0-1)
             score = max(0.0, 1.0 - (distance / max(threshold * 2, 1.0)))
 
             return {
