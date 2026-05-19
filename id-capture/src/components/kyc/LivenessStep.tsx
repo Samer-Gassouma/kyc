@@ -288,16 +288,7 @@ export default function LivenessStep({
               getBorderColor(),
             )}
           >
-            {livenessState === "passed" && selfieUrl && (
-            <div className="mb-4 overflow-hidden rounded-xl border-2 border-green-400">
-              <img
-                src={`${API_BASE}${selfieUrl}`}
-                alt="Selfie"
-                className="h-48 w-full object-cover"
-              />
-            </div>
-          )}
-          {livenessState === "passed" && (
+            {livenessState === "passed" && (
               <CheckCircle className="h-16 w-16 animate-scaleIn text-green-400" />
             )}
             {(livenessState === "failed" || livenessState === "spoof") && (
