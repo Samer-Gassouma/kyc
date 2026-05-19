@@ -93,18 +93,30 @@ BACK_ROIS: dict[str, dict[str, Any]] = {
 # ── Arabic month name → number mapping ─────────────────────────
 # Includes common OCR misspellings (EasyOCR on CIN font is noisy)
 ARABIC_MONTHS = {
-    "جانفي": "01", "يناير": "01",
-    "فيفري": "02", "فبراير": "02",
+    "جانفي": "01",
+    "يناير": "01",
+    "فيفري": "02",
+    "فبراير": "02",
     "مارس": "03",
-    "أفريل": "04", "ابريل": "04", "نيسان": "04",
-    "ماي": "05", "مايو": "05",
-    "جوان": "06", "يونيو": "06",
-    "جويلية": "07", "يوليو": "07",
-    "اوت": "08", "أوت": "08", "اغسطس": "08",
-    "سبتمبر": "09", "سىتمبر": "09",   # fuzzy variant
-    "أكتوبر": "10", "اكتوبر": "10",
+    "أفريل": "04",
+    "ابريل": "04",
+    "نيسان": "04",
+    "ماي": "05",
+    "مايو": "05",
+    "جوان": "06",
+    "يونيو": "06",
+    "جويلية": "07",
+    "يوليو": "07",
+    "اوت": "08",
+    "أوت": "08",
+    "اغسطس": "08",
+    "سبتمبر": "09",
+    "سىتمبر": "09",  # fuzzy variant
+    "أكتوبر": "10",
+    "اكتوبر": "10",
     "نوفمبر": "11",
-    "ديسمبر": "12", "دسسد": "12",   # fuzzy variant
+    "ديسمبر": "12",
+    "دسسد": "12",  # fuzzy variant
 }
 
 
@@ -144,7 +156,7 @@ def fuzzy_match_month(text: str) -> str | None:
             for j in range(max(1, nl - 2), nl + 3):
                 if i + j > tl:
                     break
-                substr = text[i:i + j]
+                substr = text[i : i + j]
                 dist = _levenshtein(substr, name)
                 if dist < best_dist:
                     best_dist = dist
@@ -153,9 +165,19 @@ def fuzzy_match_month(text: str) -> str | None:
 
 
 FIELD_LABEL_PREFIXES = [
-    "اللقب", "الاسم", "المهنة", "المهنه", "العنوان",
-    "تاريخ الولادة", "مكانها", "ترش في", "تارخ الولادة",
-    "اسم ولقب الأم", "النسب", "مكانه", "مكاتها",
+    "اللقب",
+    "الاسم",
+    "المهنة",
+    "المهنه",
+    "العنوان",
+    "تاريخ الولادة",
+    "مكانها",
+    "ترش في",
+    "تارخ الولادة",
+    "اسم ولقب الأم",
+    "النسب",
+    "مكانه",
+    "مكاتها",
 ]
 
 
@@ -203,7 +225,7 @@ def extract_best_arabic_name(text: str) -> str:
     # Strip known OCR garbage fragments that appear at start
     for garbage in ("اذرا ", "انا ", "ا ", "ال "):
         if result.startswith(garbage):
-            result = result[len(garbage):].strip()
+            result = result[len(garbage) :].strip()
     return result
 
 
@@ -243,7 +265,9 @@ def parse_arabic_date(text: str) -> str:
     return f"{year}-{month_num}-{day}"
 
 
-def preprocess_roi(roi: np.ndarray, lang: list[str] | None, roi_key: str = "") -> np.ndarray:
+def preprocess_roi(
+    roi: np.ndarray, lang: list[str] | None, roi_key: str = ""
+) -> np.ndarray:
     """Adaptive preprocessing per ROI before OCR."""
     h, w = roi.shape[:2]
     upscaled = cv2.resize(roi, (w * 2, h * 2), interpolation=cv2.INTER_LANCZOS4)
@@ -258,8 +282,8 @@ def preprocess_roi(roi: np.ndarray, lang: list[str] | None, roi_key: str = "") -
 
     # Dedicated boost for father_lineage — sits on watermark/monument noise
     if roi_key == "father_lineage":
-        alpha = 1.8   # contrast multiplier
-        beta = -30    # darken background
+        alpha = 1.8  # contrast multiplier
+        beta = -30  # darken background
         enhanced = cv2.convertScaleAbs(enhanced, alpha=alpha, beta=beta)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
         enhanced = cv2.morphologyEx(enhanced, cv2.MORPH_OPEN, kernel)
@@ -291,23 +315,32 @@ def extract_roi(
 
     if crop.size == 0:
         return {
-            "field": roi_key, "label": roi_def["label"],
-            "raw_text": "", "confidence": 0.0, "bbox": [x1, y1, x2, y2],
+            "field": roi_key,
+            "label": roi_def["label"],
+            "raw_text": "",
+            "confidence": 0.0,
+            "bbox": [x1, y1, x2, y2],
         }
 
     if roi_def.get("lang") is None:
         return {
-            "field": roi_key, "label": roi_def["label"],
-            "raw_text": "__IMAGE__", "confidence": 1.0,
-            "bbox": [x1, y1, x2, y2], "crop": crop,
+            "field": roi_key,
+            "label": roi_def["label"],
+            "raw_text": "__IMAGE__",
+            "confidence": 1.0,
+            "bbox": [x1, y1, x2, y2],
+            "crop": crop,
         }
 
     processed = preprocess_roi(crop, roi_def.get("lang"), roi_key=roi_key)
 
     try:
         results = reader.readtext(
-            processed, detail=1, paragraph=False,
-            text_threshold=0.5, low_text=0.3,
+            processed,
+            detail=1,
+            paragraph=False,
+            text_threshold=0.5,
+            low_text=0.3,
         )
     except Exception as exc:
         logger.error("EasyOCR failed on %s: %s", roi_key, exc)
@@ -315,16 +348,21 @@ def extract_roi(
 
     if not results:
         return {
-            "field": roi_key, "label": roi_def["label"],
-            "raw_text": "", "confidence": 0.0, "bbox": [x1, y1, x2, y2],
+            "field": roi_key,
+            "label": roi_def["label"],
+            "raw_text": "",
+            "confidence": 0.0,
+            "bbox": [x1, y1, x2, y2],
         }
 
     full_text = " ".join(r[1] for r in results).strip()
     avg_conf = float(np.mean([r[2] for r in results]))
 
     return {
-        "field": roi_key, "label": roi_def["label"],
-        "raw_text": full_text, "confidence": round(avg_conf, 3),
+        "field": roi_key,
+        "label": roi_def["label"],
+        "raw_text": full_text,
+        "confidence": round(avg_conf, 3),
         "bbox": [x1, y1, x2, y2],
     }
 
@@ -345,7 +383,7 @@ def parse_fields(raw: list[dict[str, Any]], side: str) -> dict[str, Any]:
         # Strip field label prefix if OCR included it
         for prefix in FIELD_LABEL_PREFIXES:
             if prefix in text:
-                text = text[text.index(prefix) + len(prefix):].lstrip(": ").strip()
+                text = text[text.index(prefix) + len(prefix) :].lstrip(": ").strip()
                 break
 
         if field == "id_number":
@@ -358,8 +396,13 @@ def parse_fields(raw: list[dict[str, Any]], side: str) -> dict[str, Any]:
                 re.match(r"^\d{8}$", data.get("id_number", ""))
             )
 
-        elif field in ("last_name", "first_name", "place_of_birth",
-                        "mother_name", "profession"):
+        elif field in (
+            "last_name",
+            "first_name",
+            "place_of_birth",
+            "mother_name",
+            "profession",
+        ):
             # Extract cleanest Arabic name sequence
             data[field] = extract_best_arabic_name(text)
 
@@ -400,10 +443,11 @@ def extract_barcode(card: np.ndarray) -> dict:
     Barcode zone: bottom 15% of card, full width.
     """
     h, w = card.shape[:2]
-    barcode_crop = card[int(h * 0.82):int(h * 0.97), 0:w]
+    barcode_crop = card[int(h * 0.82) : int(h * 0.97), 0:w]
 
-    upscaled = cv2.resize(barcode_crop, (w * 2, int(h * 0.15 * 2)),
-                          interpolation=cv2.INTER_LANCZOS4)
+    upscaled = cv2.resize(
+        barcode_crop, (w * 2, int(h * 0.15 * 2)), interpolation=cv2.INTER_LANCZOS4
+    )
     gray = cv2.cvtColor(upscaled, cv2.COLOR_BGR2GRAY)
 
     from pyzbar import pyzbar
@@ -411,8 +455,7 @@ def extract_barcode(card: np.ndarray) -> dict:
     barcodes = pyzbar.decode(gray)
 
     if not barcodes:
-        _, binary = cv2.threshold(gray, 0, 255,
-                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         barcodes = pyzbar.decode(binary)
 
     if barcodes:
@@ -465,39 +508,145 @@ def extract_card_fields(
     side: str,
     reader: Any,
 ) -> dict[str, Any]:
-    """Run ROI extraction on the SAM-corrected flat card."""
+    """Run ROI extraction on the SAM-corrected flat card.
+
+    Uses batched EasyOCR: all OCR ROIs are sent in a single call
+    instead of one-by-one, cutting OCR time by ~3x.
+    """
     roi_map = FRONT_ROIS if side == "front" else BACK_ROIS
 
     h, w = corrected_card.shape[:2]
     if (w, h) != (TARGET_W, TARGET_H):
         corrected_card = cv2.resize(
-            corrected_card, (TARGET_W, TARGET_H),
+            corrected_card,
+            (TARGET_W, TARGET_H),
             interpolation=cv2.INTER_LANCZOS4,
         )
 
-    raw_results: list[dict[str, Any]] = []
     face_crop: np.ndarray | None = None
 
+    # Phase 1: crop and preprocess all ROIs
+    ocr_batch: list[np.ndarray] = []
+    ocr_meta: list[dict[str, Any]] = []
+    photo_crop: np.ndarray | None = None
+
     for roi_key, roi_def in roi_map.items():
-        result = extract_roi(corrected_card, roi_key, roi_def, reader)
-        raw_results.append(result)
-        if roi_key == "photo" and "crop" in result:
-            face_crop = result.pop("crop")
-            logger.info("[roi] photo crop extracted: shape=%s", face_crop.shape if face_crop is not None else None)
+        x1p, y1p, x2p, y2p = roi_def["box"]
+        x1, y1 = int(x1p * w), int(y1p * h)
+        x2, y2 = int(x2p * w), int(y2p * h)
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        crop = corrected_card[y1:y2, x1:x2]
+
+        if crop.size == 0:
+            ocr_batch.append(np.zeros((32, 32), dtype=np.uint8))
+            ocr_meta.append(
+                {
+                    "field": roi_key,
+                    "label": roi_def["label"],
+                    "bbox": [x1, y1, x2, y2],
+                    "lang": roi_def.get("lang"),
+                }
+            )
+            continue
+
+        if roi_def.get("lang") is None:
+            photo_crop = crop
+            ocr_batch.append(np.zeros((32, 32), dtype=np.uint8))
+            ocr_meta.append(
+                {
+                    "field": roi_key,
+                    "label": roi_def["label"],
+                    "bbox": [x1, y1, x2, y2],
+                    "lang": None,
+                    "crop": crop,
+                }
+            )
+            continue
+
+        processed = preprocess_roi(crop, roi_def.get("lang"), roi_key=roi_key)
+        ocr_batch.append(processed)
+        ocr_meta.append(
+            {
+                "field": roi_key,
+                "label": roi_def["label"],
+                "bbox": [x1, y1, x2, y2],
+                "lang": roi_def.get("lang"),
+            }
+        )
+
+    # Phase 2: batch OCR on all text ROIs at once
+    try:
+        batch_results = reader.readtext(
+            ocr_batch,
+            detail=1,
+            paragraph=False,
+            text_threshold=0.5,
+            low_text=0.3,
+        )
+    except Exception as exc:
+        logger.error("Batch EasyOCR failed: %s", exc)
+        batch_results = [[] for _ in ocr_meta]
+
+    # Phase 3: build structured results per ROI
+    raw_results: list[dict[str, Any]] = []
+    for meta, roi_ocr in zip(ocr_meta, batch_results):
+        roi_key = meta["field"]
+        label = meta["label"]
+        bbox = meta["bbox"]
+
+        if meta.get("lang") is None:
+            result = {
+                "field": roi_key,
+                "label": label,
+                "raw_text": "__IMAGE__",
+                "confidence": 1.0,
+                "bbox": bbox,
+            }
+            if meta.get("crop") is not None:
+                result["crop"] = meta["crop"]
+                photo_crop = meta["crop"]
+            raw_results.append(result)
+            continue
+
+        if not roi_ocr:
+            raw_results.append(
+                {
+                    "field": roi_key,
+                    "label": label,
+                    "raw_text": "",
+                    "confidence": 0.0,
+                    "bbox": bbox,
+                }
+            )
+            continue
+
+        full_text = " ".join(r[1] for r in roi_ocr).strip()
+        avg_conf = float(np.mean([r[2] for r in roi_ocr]))
+        raw_results.append(
+            {
+                "field": roi_key,
+                "label": label,
+                "raw_text": full_text,
+                "confidence": round(avg_conf, 3),
+                "bbox": bbox,
+            }
+        )
+
+    if photo_crop is not None:
+        face_crop = photo_crop
+        logger.info("[roi] photo crop extracted: shape=%s", face_crop.shape)
 
     # Fallback: if photo ROI missed, try face detection on the whole card
     if side == "front" and face_crop is None:
         logger.info("[roi] photo ROI missed, trying face detection fallback")
         face_crop = _detect_and_crop_face(corrected_card)
         if face_crop is not None:
-            logger.info("[roi] face detection fallback succeeded: shape=%s", face_crop.shape)
+            logger.info(
+                "[roi] face detection fallback succeeded: shape=%s", face_crop.shape
+            )
 
     structured = parse_fields(raw_results, side)
-
-    # AI cleaner disabled: mT5-small cannot generate Arabic even after fine-tuning
-    # (not pre-trained on Arabic script). Regex pipeline already works well.
-    # from models.ocr_cleaner import clean_all_fields
-    # structured = clean_all_fields(structured)
 
     if side == "back":
         barcode_result = extract_barcode(corrected_card)
@@ -512,10 +661,7 @@ def extract_card_fields(
     return {
         "side": side,
         "fields": structured,
-        "raw_ocr": [
-            {k: v for k, v in r.items() if k != "crop"}
-            for r in raw_results
-        ],
+        "raw_ocr": [{k: v for k, v in r.items() if k != "crop"} for r in raw_results],
         "face_crop": face_crop,
     }
 
@@ -579,11 +725,16 @@ def draw_roi_debug(card: np.ndarray, side: str) -> np.ndarray:
     h, w = debug.shape[:2]
 
     colors: dict[str, tuple[int, int, int]] = {
-        "id_number": (0, 255, 0), "photo": (255, 0, 0),
-        "last_name": (0, 165, 255), "first_name": (0, 165, 255),
-        "date_of_birth": (255, 255, 0), "address_line1": (255, 0, 255),
-        "address_line2": (255, 0, 255), "issue_date": (128, 0, 128),
-        "mother_name": (0, 255, 128), "profession": (128, 128, 0),
+        "id_number": (0, 255, 0),
+        "photo": (255, 0, 0),
+        "last_name": (0, 165, 255),
+        "first_name": (0, 165, 255),
+        "date_of_birth": (255, 255, 0),
+        "address_line1": (255, 0, 255),
+        "address_line2": (255, 0, 255),
+        "issue_date": (128, 0, 128),
+        "mother_name": (0, 255, 128),
+        "profession": (128, 128, 0),
     }
 
     for key, roi in roi_map.items():
@@ -595,7 +746,8 @@ def draw_roi_debug(card: np.ndarray, side: str) -> np.ndarray:
         x1, y1 = int(x1p * w), int(y1p * h)
         x2, y2 = int(x2p * w), int(y2p * h)
         cv2.rectangle(debug, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(debug, key, (x1 + 4, y1 + 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+        cv2.putText(
+            debug, key, (x1 + 4, y1 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1
+        )
 
     return debug

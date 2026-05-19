@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-
 from core.config import settings
 from core.db import init_db
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from routers import auth, capture, extract, gallery, liveness, stream
 
 logging.basicConfig(level=logging.INFO)
@@ -47,6 +46,55 @@ async def startup():
     init_db()
     logger.info("Database initialized")
     logger.info("CORS origins: %s", origins)
+
+    # ── Preload models to avoid first-request latency ──────────────
+    import asyncio
+
+    loop = asyncio.get_event_loop()
+
+    async def _warm_models():
+        """Warm up all ML models so the first user doesn't pay the init cost."""
+        logger.info("Preloading models...")
+
+        # YOLOv8 detector
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: __import__(
+                    "models.yolo_detector", fromlist=["_load_model"]
+                )._load_model(),
+            )
+            logger.info("  ✓ YOLOv8 loaded")
+        except Exception as e:
+            logger.warning("  ✗ YOLOv8 preload failed: %s", e)
+
+        # SAM predictor (if available)
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: __import__(
+                    "models.geometry", fromlist=["_get_sam_predictor"]
+                )._get_sam_predictor(),
+            )
+            logger.info("  ✓ SAM loaded")
+        except Exception as e:
+            logger.info("  - SAM skipped: %s", e)
+
+        # EasyOCR reader
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: __import__(
+                    "tasks.ocr_task", fromlist=["_get_reader"]
+                )._get_reader(),
+            )
+            logger.info("  ✓ EasyOCR loaded")
+        except Exception as e:
+            logger.warning("  ✗ EasyOCR preload failed: %s", e)
+
+        logger.info("All models ready.")
+
+    asyncio.create_task(_warm_models())
 
 
 @app.get("/health")

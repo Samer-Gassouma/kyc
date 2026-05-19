@@ -9,9 +9,8 @@ from typing import Any
 
 import cv2
 import numpy as np
-
 from core.config import settings
-from core.db import SessionLocal, KYCResult, Capture
+from core.db import Capture, KYCResult, SessionLocal
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +34,11 @@ def _run_easyocr(image: np.ndarray) -> list[dict[str, Any]]:
         reader = _get_reader()
         results = reader.readtext(image)
         return [
-            {"text": text, "confidence": float(conf), "bbox": [list(map(int, p)) for p in bbox]}
+            {
+                "text": text,
+                "confidence": float(conf),
+                "bbox": [list(map(int, p)) for p in bbox],
+            }
             for bbox, text, conf in results
         ]
     except Exception as e:
@@ -49,9 +52,10 @@ def _run_mrz_parse(image: np.ndarray) -> dict[str, Any] | None:
     Tries passporteye first, falls back to regex over OCR text.
     """
     try:
-        from passporteye import read_mrz
-        import tempfile
         import os
+        import tempfile
+
+        from passporteye import read_mrz
 
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
             cv2.imwrite(f.name, image)
@@ -86,7 +90,9 @@ def _run_mrz_parse(image: np.ndarray) -> dict[str, Any] | None:
             line1, line2 = mrz_lines[0], mrz_lines[1]
             return {
                 "surname": line1[5:].split("<<")[0].replace("<", " ").strip(),
-                "given_names": line1[5:].split("<<")[1].replace("<", " ").strip() if "<<" in line1[5:] else "",
+                "given_names": line1[5:].split("<<")[1].replace("<", " ").strip()
+                if "<<" in line1[5:]
+                else "",
                 "nationality": line2[15:18].replace("<", ""),
                 "dob": line2[13:19] if len(line2) > 19 else "",
                 "id_number": line2[0:9].replace("<", ""),
@@ -119,13 +125,27 @@ def _save_roi_result(
         face_key: str | None = None
         if side == "front":
             if face_crop is None:
-                logger.warning("[face_crop] capture=%s side=front: face_crop is None", capture_id)
+                logger.warning(
+                    "[face_crop] capture=%s side=front: face_crop is None", capture_id
+                )
             else:
-                logger.info("[face_crop] capture=%s side=front: shape=%s dtype=%s", capture_id, face_crop.shape, face_crop.dtype)
+                logger.info(
+                    "[face_crop] capture=%s side=front: shape=%s dtype=%s",
+                    capture_id,
+                    face_crop.shape,
+                    face_crop.dtype,
+                )
                 try:
                     from core.storage import upload_encrypted
-                    ok, buf = cv2.imencode(".jpg", face_crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
-                    logger.info("[face_crop] imencode ok=%s buf_len=%s", ok, len(buf) if ok else 0)
+
+                    ok, buf = cv2.imencode(
+                        ".jpg", face_crop, [cv2.IMWRITE_JPEG_QUALITY, 92]
+                    )
+                    logger.info(
+                        "[face_crop] imencode ok=%s buf_len=%s",
+                        ok,
+                        len(buf) if ok else 0,
+                    )
                     if ok:
                         face_key = upload_encrypted(
                             buf.tobytes(),
@@ -151,12 +171,21 @@ def _save_roi_result(
         if side == "front" and face_crop is not None:
             try:
                 import base64
-                ok, buf = cv2.imencode(".jpg", face_crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
+
+                ok, buf = cv2.imencode(
+                    ".jpg", face_crop, [cv2.IMWRITE_JPEG_QUALITY, 92]
+                )
                 if ok:
                     face_crop_b64 = base64.b64encode(buf).decode("utf-8")
-                    logger.info("[face_crop] base64 encoded: %s bytes", len(face_crop_b64))
+                    logger.info(
+                        "[face_crop] base64 encoded: %s bytes", len(face_crop_b64)
+                    )
                 else:
-                    logger.warning("[face_crop] cv2.imencode returned False — crop shape=%s dtype=%s", face_crop.shape, face_crop.dtype)
+                    logger.warning(
+                        "[face_crop] cv2.imencode returned False — crop shape=%s dtype=%s",
+                        face_crop.shape,
+                        face_crop.dtype,
+                    )
             except Exception as exc:
                 logger.warning("[face_crop] base64 encode failed: %s", exc)
 
@@ -172,13 +201,26 @@ def _save_roi_result(
             existing.ocr_fields = json.dumps(payload)
             existing.mrz_check_digits_valid = fields.get("id_number_valid", False)
         else:
-            db.add(KYCResult(
-                capture_id=capture_id,
-                side=side,
-                ocr_fields=json.dumps(payload),
-                mrz_check_digits_valid=fields.get("id_number_valid", False),
-            ))
+            db.add(
+                KYCResult(
+                    capture_id=capture_id,
+                    side=side,
+                    ocr_fields=json.dumps(payload),
+                    mrz_check_digits_valid=fields.get("id_number_valid", False),
+                )
+            )
         db.commit()
+
+        # ── Notify via Redis Pub/Sub that this capture is done ─────
+        try:
+            import redis as redis_sync
+            from core.config import settings
+
+            r = redis_sync.from_url(settings.redis_url)
+            r.publish(f"kyc:capture:{capture_id}:done", "completed")
+            r.close()
+        except Exception as exc:
+            logger.warning("Redis pub/sub publish failed (non-fatal): %s", exc)
     finally:
         db.close()
 
@@ -227,7 +269,9 @@ def process_ocr(
         if corrected_card is not None:
             logger.info("Running ROI extraction for capture %s (%s)", capture_id, side)
             return process_roi_extraction(corrected_card, capture_id, side)
-        logger.warning("Failed to decode corrected card for %s, falling back", capture_id)
+        logger.warning(
+            "Failed to decode corrected card for %s, falling back", capture_id
+        )
 
     # ── Fallback: generic OCR on raw uploaded image ────────────────
     arr = np.frombuffer(image_bytes, dtype=np.uint8)
