@@ -36,6 +36,10 @@ interface LivenessResponse {
   face_landmarks?: {x: number; y: number}[] | null;
   face_yaw?: number;
   face_pitch?: number;
+  consecutive_progress?: number;
+  consecutive_needed?: number;
+  challenge_idx?: number;
+  total_challenges?: number;
 }
 
 type LivenessState = "connecting" | "calibrating" | "running" | "passed" | "failed";
@@ -123,6 +127,8 @@ export default function LivenessStep({
   const [finalizing, setFinalizing] = useState(false);
   const [camError, setCamError] = useState<string | null>(null);
   const [faceLandmarks, setFaceLandmarks] = useState<{x: number; y: number}[] | null>(null);
+  const [progress, setProgress] = useState(0);
+  const [progressNeeded, setProgressNeeded] = useState(2);
   const [faceBBox, setFaceBBox] = useState<number[] | null>(null);
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -194,6 +200,8 @@ export default function LivenessStep({
             setFaceDetected(data.face_detected ?? true);
             setInstruction(data.instruction);
             if (data.face_landmarks) setFaceLandmarks(data.face_landmarks);
+            setProgress(data.consecutive_progress ?? 0);
+            setProgressNeeded(data.consecutive_needed ?? 2);
             if (data.face_bbox) setFaceBBox(data.face_bbox);
 
             if (data.calibrated === false) {
@@ -372,6 +380,14 @@ export default function LivenessStep({
               {getGestureIcon()}
               <span>{instruction}</span>
             </div>
+            {livenessState === "running" && progressNeeded > 1 && (
+              <div className="h-1.5 w-48 overflow-hidden rounded-full bg-zinc-700">
+                <div
+                  className="h-full rounded-full bg-green-400 transition-all duration-200"
+                  style={{ width: `${Math.min(100, (progress / progressNeeded) * 100)}%` }}
+                />
+              </div>
+            )}
             {!faceDetected && (
               <p className="text-xs text-yellow-500">
                 وجهك غير ظاهر — انظر إلى الكاميرا

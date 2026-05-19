@@ -40,8 +40,8 @@ _LANDMARKER_PATH = _WEIGHTS_DIR / "face_landmarker_v2_with_blendshapes.task"
 sys.path.insert(0, str(_VENDOR_DIR))
 
 # ── Constants ──────────────────────────────────────────────────────
-CALIBRATION_FRAMES = 20  # frames to establish per-user baseline
-HYSTERESIS_FRAMES = 3  # consecutive frames to confirm a gesture
+CALIBRATION_FRAMES = 15  # frames to establish per-user baseline
+HYSTERESIS_FRAMES = 2  # consecutive frames to confirm a gesture
 CHALLENGE_TIMEOUT = 15.0  # seconds per gesture challenge
 FPS_TARGET = 10  # expected WebSocket frame rate
 MIN_FACE_WIDTH_RATIO = 0.12  # face must cover >20% of frame width
@@ -61,7 +61,7 @@ EYE_R_IDX = [362, 263, 387, 386, 385, 373, 380, 381, 382]
 BLINK_RATIO = 0.65
 
 # Head turn: |yaw| exceeds TURN_YAW_DEG from baseline
-TURN_YAW_DEG = 15.0
+TURN_YAW_DEG = 12.0
 
 # MiniFASNet spoof threshold
 SPOOF_SCORE_THRESHOLD = 0.6
@@ -418,40 +418,48 @@ class LivenessSession:
 
         if matched:
             self.consecutive_count += 1
-        else:
-            self.consecutive_count = 0
-
-        if self.consecutive_count >= HYSTERESIS_FRAMES:
-            # Challenge passed!
-            logger.info("Session %s: %s passed", self.session_id, challenge)
-            self.current_challenge_idx += 1
-            self.consecutive_count = 0
-            self.challenge_start = time.time()
-
-            if self.current_challenge_idx >= len(self.challenges):
-                self.passed = True
-                self.instruction = "تم التحقق"
+            remaining = HYSTERESIS_FRAMES - self.consecutive_count
+            if remaining <= 0:
+                # Challenge passed!
+                logger.info("Session %s: %s passed", self.session_id, challenge)
+                self.current_challenge_idx += 1
+                self.consecutive_count = 0
+                self.challenge_start = time.time()
+                if self.current_challenge_idx >= len(self.challenges):
+                    self.passed = True
+                    self.instruction = "تم التحقق \u2714"
+                else:
+                    self.instruction = self._challenge_instruction() + " \u2714"
             else:
-                self.instruction = self._challenge_instruction()
+                self.instruction = self._challenge_instruction() + f" ({remaining})"
         else:
-            # In progress
-            self.instruction = self._challenge_instruction()
+            if self.consecutive_count > 0:
+                # Lost it — give encouraging message
+                self.instruction = self._challenge_instruction()
+            self.consecutive_count = 0
 
     def _challenge_instruction(self) -> str:
-        """Arabic instruction for the current challenge."""
+        """Arabic instruction with progress counter."""
         if self.current_challenge_idx >= len(self.challenges):
             return "تم التحقق"
+        total = len(self.challenges)
+        n = self.current_challenge_idx + 1
+        prefix = f"({n}/{total}) "
         c = self.challenges[self.current_challenge_idx]
         if c == "BLINK":
-            return "أغمض عينيك"
+            return prefix + "أغمض عينيك"
         elif c == "TURN_LEFT":
-            return "أدر وجهك إلى اليسار"
+            return prefix + "أدر وجهك إلى اليسار"
         elif c == "TURN_RIGHT":
-            return "أدر وجهك إلى اليمين"
-        return "انظر إلى الكاميرا"
+            return prefix + "أدر وجهك إلى اليمين"
+        return prefix + "انظر إلى الكاميرا"
 
     def _response(self) -> dict[str, Any]:
         """Build the JSON response for the frontend."""
+        challenge_active = (
+            not self.passed and not self.failed
+            and self.current_challenge_idx < len(self.challenges)
+        )
         return {
             "passed": self.passed,
             "failed": self.failed,
@@ -459,13 +467,11 @@ class LivenessSession:
             "face_detected": self.face_detected,
             "selfie_ready": self.passed,
             "calibrated": self.calibrated,
-            "challenge": (
-                self.challenges[self.current_challenge_idx]
-                if not self.passed
-                and not self.failed
-                and self.current_challenge_idx < len(self.challenges)
-                else None
-            ),
+            "challenge": self.challenges[self.current_challenge_idx] if challenge_active else None,
+            "challenge_idx": self.current_challenge_idx if challenge_active else -1,
+            "total_challenges": len(self.challenges),
+            "consecutive_progress": self.consecutive_count,
+            "consecutive_needed": HYSTERESIS_FRAMES,
             # Face tracking for frontend visualization
             "face_bbox": list(self.face_bbox) if self.face_bbox else None,
             "face_landmarks": self.face_landmarks_2d,
