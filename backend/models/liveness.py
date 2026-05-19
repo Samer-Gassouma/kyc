@@ -183,7 +183,7 @@ class LivenessSession:
 
         lm = _get_landmarks(enhanced, (x1, y1, x2, y2))
         if lm and len(lm) >= 20:
-            self.landmarks_2d = [{"x": round(p[0], 1), "y": round(p[1], 1)} for p in lm[:25]]
+            self.landmarks_2d = [{"x": round(p[0], 1), "y": round(p[1], 1)} for p in lm]
 
         liveness = _check_liveness(enhanced, (x1, y1, x2, y2))
         self.liveness_score = liveness
@@ -221,6 +221,7 @@ class LivenessSession:
             "progress": min(100, int(self.real_frames / NEEDED_FRAMES * 100)),
             "face_bbox": [int(v) for v in self.face_bbox] if self.face_bbox else None,
             "face_landmarks": self.landmarks_2d,
+            "face_landmarks_full": True,
         }
 
 _sessions: dict[str, LivenessSession] = {}
