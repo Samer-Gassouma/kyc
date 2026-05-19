@@ -32,11 +32,6 @@ logger = logging.getLogger(__name__)
 _MODEL_DIR = Path(__file__).parent.parent.parent / "id-capture" / "public" / "models"
 
 # ── Constants (permissive) ─────────────────────────────────────────
-CALIBRATION_FRAMES = 15
-HYSTERESIS_FRAMES = 2
-CHALLENGE_TIMEOUT = 15.0
-BLINK_EYE_RATIO = 0.6  # eye open prob below this = blinking
-TURN_YAW_DEG = 12.0  # yaw deviation to trigger turn
 MIN_FACE_SCORE = 0.5  # face detection confidence
 LIVENESS_SCORE_MIN = 0.3  # real face must score above this on class 1
 
@@ -60,23 +55,38 @@ def _get_session(name: str) -> ort.InferenceSession:
 # ═══════════════════════════════════════════════════════════════════
 
 
+_dnn_face_net: Any = None
+
 def _detect_face(frame: np.ndarray) -> tuple | None:
-    """Detect largest face. Returns (x1, y1, x2, y2, score) or None."""
-    sess = _get_session("fr_detect")
+    """Detect largest face using OpenCV DNN. Returns (x1,y1,x2,y2,score) or None."""
+    global _dnn_face_net
     h, w = frame.shape[:2]
-    img = cv2.resize(frame, (320, 240))
-    blob = img.astype(np.float32).transpose(2, 0, 1)[None]  # 1×3×240×320
-    scores, boxes = sess.run(None, {"input": blob})
+    
+    if _dnn_face_net is None:
+        model_file = str(_MODEL_DIR.parent.parent.parent / "backend" / "vendor" / "silent_antispoofing" / "resources" / "detection_model" / "deploy.prototxt")
+        weights_file = str(_MODEL_DIR.parent.parent.parent / "backend" / "vendor" / "silent_antispoofing" / "resources" / "detection_model" / "Widerface-RetinaFace.caffemodel")
+        _dnn_face_net = cv2.dnn.readNetFromCaffe(model_file, weights_file)
+        logger.info("OpenCV DNN face detector loaded (RetinaFace)")
 
-    best_idx = int(np.argmax(scores[0, :, 1]))
-    best_score = float(scores[0, best_idx, 1])
-    if best_score < MIN_FACE_SCORE:
+    blob = cv2.dnn.blobFromImage(frame, 1.0, (320, 240), (104, 117, 123))
+    _dnn_face_net.setInput(blob)
+    detections = _dnn_face_net.forward()
+
+    best_score = 0.0
+    best_box = None
+    for i in range(detections.shape[2]):
+        conf = detections[0, 0, i, 2]
+        if conf > best_score:
+            best_score = conf
+            x1 = int(detections[0, 0, i, 3] * w)
+            y1 = int(detections[0, 0, i, 4] * h)
+            x2 = int(detections[0, 0, i, 5] * w)
+            y2 = int(detections[0, 0, i, 6] * h)
+            best_box = (x1, y1, x2, y2)
+
+    if best_score < MIN_FACE_SCORE or best_box is None:
         return None
-
-    bx1, by1, bx2, by2 = boxes[0, best_idx]
-    # Scale back to original size
-    sx, sy = w / 320.0, h / 240.0
-    return (int(bx1 * sx), int(by1 * sy), int(bx2 * sx), int(by2 * sy), best_score)
+    return (*best_box, best_score)
 
 
 def _get_landmarks(frame: np.ndarray, bbox: tuple) -> list | None:
@@ -89,7 +99,7 @@ def _get_landmarks(frame: np.ndarray, bbox: tuple) -> list | None:
 
     gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
     resized = cv2.resize(gray, (64, 64))
-    blob = resized.astype(np.float32)[None, None] / 255.0  # 1×1×64×64
+    blob = ((resized.astype(np.float32) - 127.0) / 128.0)[None, None]
 
     result = sess.run(None, {"input": blob})[0][0]  # [136]
     landmarks = []
@@ -109,8 +119,8 @@ def _check_liveness(frame: np.ndarray, bbox: tuple) -> float:
     if face.size == 0:
         return 0.0
 
-    resized = cv2.resize(face, (128, 128))
-    blob = resized.astype(np.float32).transpose(2, 0, 1)[None]  # 1×3×128×128
+    rgb = cv2.cvtColor(cv2.resize(face, (128, 128)), cv2.COLOR_BGR2RGB)
+    blob = ((rgb.astype(np.float32) - 127.0) / 128.0).transpose(2, 0, 1)[None]
     result = sess.run(None, {"input": blob})[0][0]  # [3]
     # Softmax: class 1 = real
     exp = np.exp(result - np.max(result))
@@ -118,59 +128,6 @@ def _check_liveness(frame: np.ndarray, bbox: tuple) -> float:
     return float(probs[1])
 
 
-def _check_eyes(frame: np.ndarray, landmarks: list) -> tuple[float, float]:
-    """Eye open probability for left and right eye. (0-1 each)."""
-    sess = _get_session("fr_eye")
-
-    def _eye_prob(eye_pts):
-        xs = [p[0] for p in eye_pts]
-        ys = [p[1] for p in eye_pts]
-        x1, y1 = int(min(xs)), int(min(ys))
-        x2, y2 = int(max(xs)), int(max(ys))
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
-        if x2 <= x1 or y2 <= y1:
-            return 0.5
-        eye = frame[y1:y2, x1:x2]
-        gray = cv2.cvtColor(eye, cv2.COLOR_BGR2GRAY)
-        resized = cv2.resize(gray, (24, 24))
-        blob = resized.astype(np.float32)[None, None] / 255.0  # 1×1×24×24
-        result = sess.run(None, {"input": blob})[0][0]  # [2]
-        exp = np.exp(result - np.max(result))
-        return float(exp[1] / exp.sum())  # prob of "open"
-
-    # Eye landmark indices (68-point model)
-    left_eye_idx = list(range(36, 42))
-    right_eye_idx = list(range(42, 48))
-
-    if len(landmarks) < 48:
-        return 1.0, 1.0
-
-    left_open = _eye_prob([landmarks[i] for i in left_eye_idx])
-    right_open = _eye_prob([landmarks[i] for i in right_eye_idx])
-    return left_open, right_open
-
-
-def _get_pose(frame: np.ndarray, bbox: tuple) -> tuple[float, float, float]:
-    """Head pose. Returns (yaw, pitch, roll) in degrees."""
-    sess = _get_session("fr_pose")
-    x1, y1, x2, y2 = bbox[:4]
-    face = frame[y1:y2, x1:x2]
-    if face.size == 0:
-        return 0.0, 0.0, 0.0
-
-    # ImageNet normalize
-    resized = cv2.resize(face, (224, 224)).astype(np.float32) / 255.0
-    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-    blob = ((resized - mean) / std).transpose(2, 0, 1)[None]
-
-    result = sess.run(None, {"input": blob})[0][0]  # [66]
-    # The first 3 values are yaw/pitch/roll in radians
-    yaw = float(result[0]) * 180.0 / math.pi
-    pitch = float(result[1]) * 180.0 / math.pi
-    roll = float(result[2]) * 180.0 / math.pi
-    return yaw, pitch, roll
 
 
 # ═══════════════════════════════════════════════════════════════════

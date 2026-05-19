@@ -30,16 +30,10 @@ interface LivenessResponse {
   face_detected?: boolean;
   spoof_detected?: boolean;
   selfie_ready?: boolean;
-  calibrated?: boolean;
-  challenge?: string | null;
+  liveness_score?: number;
+  progress?: number;
   face_bbox?: number[] | null;
   face_landmarks?: {x: number; y: number}[] | null;
-  face_yaw?: number;
-  face_pitch?: number;
-  consecutive_progress?: number;
-  consecutive_needed?: number;
-  challenge_idx?: number;
-  total_challenges?: number;
 }
 
 type LivenessState = "connecting" | "calibrating" | "running" | "passed" | "failed";
@@ -200,15 +194,11 @@ export default function LivenessStep({
             setFaceDetected(data.face_detected ?? true);
             setInstruction(data.instruction);
             if (data.face_landmarks) setFaceLandmarks(data.face_landmarks);
-            setProgress(data.consecutive_progress ?? 0);
-            setProgressNeeded(data.consecutive_needed ?? 2);
+            setProgress(data.progress ?? 0);
+            setProgressNeeded(100);
             if (data.face_bbox) setFaceBBox(data.face_bbox);
 
-            if (data.calibrated === false) {
-              setLivenessState("calibrating");
-            } else if (data.calibrated) {
-              setLivenessState("running");
-            }
+            setLivenessState("running");
             if (data.passed) {
               setLivenessState("passed");
               setFinalizing(true);
