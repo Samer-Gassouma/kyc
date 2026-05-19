@@ -1,207 +1,479 @@
 """
-Active + passive liveness detection.
+Pure Python liveness detection — no external binaries.
 
-Stage 1 (passive): ONNX DeepPixBiS anti-spoofing (~20ms/frame)
-  — Catches photo/video replay before gesture challenge starts.
+Architecture:
+  1. MediaPipe FaceDetector   → face size check (>20% frame width)
+  2. Adaptive calibration     → per-user EAR baseline (first 30 frames)
+  3. MediaPipe FaceLandmarker → 468 landmarks + 4×4 transform matrix
+  4. Challenge state machine  → BLINK → TURN_LEFT → TURN_RIGHT
+  5. MiniFASNet anti-spoof    → dual-model fusion, every 5th frame
 
-Stage 2 (active): liveness-detector gesture challenges
-  — Randomized: blink, head turn left/right, smile.
-  — Runs server-side, frames sent via WebSocket.
+Key design:
+  - Hysteresis: N consecutive frames to confirm a gesture
+  - Adaptive thresholds: EAR baseline calibrated per session
+  - Per-session state isolation: fully independent per WebSocket
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import os
+import sys
 import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
 import cv2
+import mediapipe as mp
 import numpy as np
-import onnxruntime as ort
+import torch
 
 logger = logging.getLogger(__name__)
 
 # ── Paths ──────────────────────────────────────────────────────────
-_VENDOR_DIR = Path(__file__).parent.parent / "vendor" / "face-liveness"
-_SPOOF_MODEL_PATH = (
-    _VENDOR_DIR / "data" / "checkpoints" / "OULU_Protocol_2_model_0_0.onnx"
-)
+_WEIGHTS_DIR = Path(__file__).parent.parent / "weights"
+_VENDOR_DIR = Path(__file__).parent.parent / "vendor" / "silent_antispoofing"
+_LANDMARKER_PATH = _WEIGHTS_DIR / "face_landmarker_v2_with_blendshapes.task"
 
-# ── Thresholds ─────────────────────────────────────────────────────
-SPOOF_THRESHOLD = 0.03  # below this = spoof (photo/video replay)
-MAX_TIMEOUT_SECONDS = 45  # total time for gesture challenge
+sys.path.insert(0, str(_VENDOR_DIR))
 
-# ── ONNX anti-spoofing (lazy singleton) ────────────────────────────
-_spoof_session: ort.InferenceSession | None = None
+# ── Constants ──────────────────────────────────────────────────────
+CALIBRATION_FRAMES = 30  # frames to establish per-user baseline
+HYSTERESIS_FRAMES = 5  # consecutive frames to confirm a gesture
+CHALLENGE_TIMEOUT = 10.0  # seconds per gesture challenge
+FPS_TARGET = 10  # expected WebSocket frame rate
+MIN_FACE_WIDTH_RATIO = 0.20  # face must cover >20% of frame width
 
-# ImageNet normalization (same as torchvision)
-_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-_IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+# Eye landmark indices (MediaPipe 468-mesh)
+LEFT_EYE_IDX = [33, 160, 158, 133, 153, 144]
+RIGHT_EYE_IDX = [362, 385, 387, 263, 373, 380]
+
+# Blink: EAR drops below baseline * BLINK_RATIO
+BLINK_RATIO = 0.72
+
+# Head turn: |yaw| exceeds TURN_YAW_DEG from baseline
+TURN_YAW_DEG = 18.0
+
+# MiniFASNet spoof threshold
+SPOOF_SCORE_THRESHOLD = 0.6
 
 
-def _get_spoof_model() -> ort.InferenceSession:
-    global _spoof_session
-    if _spoof_session is None:
-        if not _SPOOF_MODEL_PATH.exists():
-            _SPOOF_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-            import urllib.request
+# ═══════════════════════════════════════════════════════════════════
+# MediaPipe singletons (loaded once, shared across sessions)
+# ═══════════════════════════════════════════════════════════════════
 
-            logger.info("Downloading ONNX anti-spoofing model...")
-            urllib.request.urlretrieve(
-                "https://github.com/ffletcherr/face-recognition-liveness/releases/download/v0.1/OULU_Protocol_2_model_0_0.onnx",
-                str(_SPOOF_MODEL_PATH),
+_face_cascade: Any = None
+_face_landmarker: Any = None
+
+
+def _get_face_cascade():
+    global _face_cascade
+    if _face_cascade is None:
+        _face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+        logger.info("OpenCV Haar cascade loaded")
+    return _face_cascade
+
+
+def _get_face_landmarker():
+    global _face_landmarker
+    if _face_landmarker is None:
+        from mediapipe.tasks.python import BaseOptions, vision
+
+        opts = vision.FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=str(_LANDMARKER_PATH)),
+            output_face_blendshapes=False,
+            output_facial_transformation_matrixes=True,
+            num_faces=1,
+            running_mode=vision.RunningMode.IMAGE,
+        )
+        _face_landmarker = vision.FaceLandmarker.create_from_options(opts)
+        logger.info("MediaPipe FaceLandmarker loaded")
+    return _face_landmarker
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MiniFASNet anti-spoofing (dual-model fusion)
+# ═══════════════════════════════════════════════════════════════════
+
+_anti_spoof: Any = None
+_anti_cropper: Any = None
+_anti_models = [
+    "2.7_80x80_MiniFASNetV2.pth",
+    "4_0_0_80x80_MiniFASNetV1SE.pth",
+]
+_anti_model_dir = _VENDOR_DIR / "resources" / "anti_spoof_models"
+
+
+def _get_anti_spoof():
+    global _anti_spoof, _anti_cropper
+    if _anti_spoof is None:
+        from src.anti_spoof_predict import AntiSpoofPredict, Detection
+        from src.generate_patches import CropImage
+        from src.utility import parse_model_name
+
+        # Patch Detection to use absolute paths
+        _orig_init = Detection.__init__
+
+        def _patched_init(self):
+            deploy = str(
+                _VENDOR_DIR / "resources" / "detection_model" / "deploy.prototxt"
             )
-        _spoof_session = ort.InferenceSession(
-            str(_SPOOF_MODEL_PATH), providers=["CPUExecutionProvider"]
-        )
-        logger.info("ONNX anti-spoofing model loaded")
-    return _spoof_session
+            caffemodel = str(
+                _VENDOR_DIR
+                / "resources"
+                / "detection_model"
+                / "Widerface-RetinaFace.caffemodel"
+            )
+            self.detector = cv2.dnn.readNetFromCaffe(deploy, caffemodel)
+            self.detector_confidence = 0.6
+
+        Detection.__init__ = _patched_init
+        try:
+            _anti_spoof = AntiSpoofPredict(0)
+        finally:
+            Detection.__init__ = _orig_init
+
+        _anti_cropper = CropImage()
+        logger.info("MiniFASNet anti-spoofing loaded (dual-model, CPU)")
+    return _anti_spoof, _anti_cropper
 
 
-def check_spoof(face_crop: np.ndarray) -> float:
-    """Run DeepPixBiS anti-spoofing on a face crop.
-
-    Returns liveness score 0-1. Higher = more real.
-    Score < 0.03 strongly indicates a photo/video replay.
-    """
+def _run_anti_spoof(frame: np.ndarray) -> dict:
+    """Run MiniFASNet dual-model fusion. Returns score + is_real."""
     try:
-        sess = _get_spoof_model()
+        from src.utility import parse_model_name
 
-        # Preprocess: BGR → RGB → resize 224×224 → normalize → NCHW
-        rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
-        resized = cv2.resize(rgb, (224, 224))
-        blob = resized.astype(np.float32) / 255.0
-        blob = (blob - _IMAGENET_MEAN) / _IMAGENET_STD
-        blob = np.transpose(blob, (2, 0, 1))[None]  # 1×3×224×224
+        predictor, cropper = _get_anti_spoof()
+        bbox = predictor.get_bbox(frame)
+        if bbox is None:
+            return {"face_found": False, "score": 0.0, "is_real": False}
 
-        output_pixel, output_binary = sess.run(
-            ["output_pixel", "output_binary"],
-            {"input": blob.astype(np.float32)},
-        )
-        score = float((np.mean(output_pixel) + np.mean(output_binary)) / 2.0)
-        return score
+        prediction = np.zeros((1, 3))
+        count = 0
+        for model_name in _anti_models:
+            mp = _anti_model_dir / model_name
+            if not mp.exists():
+                continue
+            h_in, w_in, mtype, scale = parse_model_name(model_name)
+            param = {
+                "org_img": frame,
+                "bbox": bbox,
+                "scale": scale,
+                "out_w": w_in,
+                "out_h": h_in,
+                "crop": scale is not None,
+            }
+            img = cropper.crop(**param)
+            prediction += predictor.predict(img, str(mp))
+            count += 1
+
+        if count == 0:
+            return {"face_found": True, "score": 0.0, "is_real": False}
+
+        label = int(np.argmax(prediction))
+        value = float(prediction[0][label] / count)
+        return {
+            "face_found": True,
+            "score": round(value, 4),
+            "is_real": (label == 1) and (value > SPOOF_SCORE_THRESHOLD),
+        }
     except Exception as exc:
-        logger.error("Spoof check failed: %s", exc)
-        return 1.0  # fail open
+        logger.error("MiniFASNet failed: %s", exc)
+        return {"face_found": False, "score": 0.0, "is_real": True}
 
 
-# ── Session management ─────────────────────────────────────────────
-_sessions: dict[str, dict[str, Any]] = {}
+# ═══════════════════════════════════════════════════════════════════
+# Geometry helpers
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _compute_ear(landmarks, indices) -> float:
+    """Eye Aspect Ratio for a single eye."""
+    pts = [np.array([landmarks[i].x, landmarks[i].y]) for i in indices]
+    # EAR = (|p2-p6| + |p3-p5|) / (2 * |p1-p4|)
+    a = np.linalg.norm(pts[1] - pts[5])
+    b = np.linalg.norm(pts[2] - pts[4])
+    c = np.linalg.norm(pts[0] - pts[3])
+    if c < 1e-6:
+        return 1.0
+    return float((a + b) / (2.0 * c))
+
+
+def _decompose_transform(matrix_4x4) -> tuple[float, float, float]:
+    """Extract yaw, pitch, roll (degrees) from 4×4 facial transform matrix."""
+    m = np.array(matrix_4x4).reshape(4, 4)
+    # Rotation matrix is top-left 3×3
+    R = m[:3, :3]
+
+    sy = math.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
+    singular = sy < 1e-6
+
+    if not singular:
+        pitch = float(math.atan2(-R[2, 0], sy))
+        yaw = float(math.atan2(R[1, 0], R[0, 0]))
+        roll = float(math.atan2(R[2, 1], R[2, 2]))
+    else:
+        pitch = float(math.atan2(-R[2, 0], sy))
+        yaw = float(math.atan2(-R[1, 2], R[1, 1]))
+        roll = 0.0
+
+    return math.degrees(yaw), math.degrees(pitch), math.degrees(roll)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Per-session state
+# ═══════════════════════════════════════════════════════════════════
+
+
+class LivenessSession:
+    """Fully isolated per-WebSocket liveness state machine."""
+
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        self.frame_count = 0
+        self.start_time = time.time()
+
+        # Calibration
+        self.calibrated = False
+        self.ear_samples: list[float] = []
+        self.yaw_samples: list[float] = []
+        self.ear_baseline = 0.30  # default, overwritten after calibration
+        self.yaw_neutral = 0.0
+
+        # Challenge state machine
+        import random
+
+        self.challenges = ["BLINK", "TURN_LEFT", "TURN_RIGHT"]
+        random.shuffle(self.challenges)
+        self.current_challenge_idx = 0
+        self.challenge_start = 0.0
+        self.consecutive_count = 0  # hysteresis counter
+
+        # Result
+        self.passed = False
+        self.failed = False
+        self.instruction = "انظر إلى الكاميرا"
+        self.face_detected = False
+
+        # Selfie capture
+        self.best_frame: np.ndarray | None = None
+        self.best_quality = 0.0
+        self.selfie_path: str | None = None
+
+        # Anti-spoof throttle
+        self.last_spoof_check = 0
+
+        logger.info("Session %s: challenges = %s", session_id, self.challenges)
+
+    # ── Per-frame processing ───────────────────────────────────
+
+    def process(self, frame: np.ndarray) -> dict[str, Any]:
+        """Process one frame. Returns UI state dict."""
+        self.frame_count += 1
+
+        # Timeout
+        if time.time() - self.start_time > 60 and not self.passed:
+            self.failed = True
+            self.instruction = "انتهت المهلة"
+
+        if self.failed:
+            return self._response()
+        if self.passed:
+            return self._response()
+
+        # ── 1. Face detection + size check ─────────────────────
+        h, w = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        cascade = _get_face_cascade()
+        faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+
+        if len(faces) == 0:
+            self.face_detected = False
+            self.instruction = "ضع وجهك في الإطار"
+            self.consecutive_count = 0
+            return self._response()
+
+        # Use largest face
+        x, y, fw, fh = max(faces, key=lambda f: f[2])
+        if fw < w * MIN_FACE_WIDTH_RATIO:
+            self.face_detected = False
+            self.instruction = "قرب وجهك من الكاميرا"
+            self.consecutive_count = 0
+            return self._response()
+
+        self.face_detected = True
+
+        # ── 2. Landmark extraction ─────────────────────────────
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        landmarker = _get_face_landmarker()
+        lm_result = landmarker.detect(mp_img)
+
+        if not lm_result.face_landmarks:
+            self.consecutive_count = 0
+            return self._response()
+
+        landmarks = lm_result.face_landmarks[0]
+
+        # EAR
+        left_ear = _compute_ear(landmarks, LEFT_EYE_IDX)
+        right_ear = _compute_ear(landmarks, RIGHT_EYE_IDX)
+        ear = (left_ear + right_ear) / 2.0
+
+        # Head pose from transform matrix
+        yaw = 0.0
+        if lm_result.facial_transformation_matrixes:
+            yaw, pitch, roll = _decompose_transform(
+                lm_result.facial_transformation_matrixes[0].data
+            )
+
+        # ── Anti-spoof every 5th frame ─────────────────────────
+        if self.frame_count - self.last_spoof_check >= 5:
+            self.last_spoof_check = self.frame_count
+            spoof = _run_anti_spoof(frame)
+            if spoof["face_found"] and not spoof["is_real"]:
+                self.failed = True
+                self.instruction = "يرجى استخدام وجهك الحقيقي"
+                return self._response()
+
+        # ── 3. Calibration phase ───────────────────────────────
+        if not self.calibrated:
+            self.ear_samples.append(ear)
+            self.yaw_samples.append(yaw)
+            self.instruction = "ثابت... يتم المعايرة"
+
+            if len(self.ear_samples) >= CALIBRATION_FRAMES:
+                self.ear_baseline = float(np.mean(self.ear_samples))
+                self.yaw_neutral = float(np.mean(self.yaw_samples))
+                self.calibrated = True
+                self.challenge_start = time.time()
+                logger.info(
+                    "Session %s calibrated: EAR_baseline=%.4f yaw_neutral=%.1f°",
+                    self.session_id,
+                    self.ear_baseline,
+                    self.yaw_neutral,
+                )
+                self.instruction = self._challenge_instruction()
+            return self._response()
+
+        # ── 4. Challenge state machine ─────────────────────────
+        self._evaluate_challenge(ear, yaw)
+        return self._response()
+
+    # ── Challenge evaluation ───────────────────────────────────
+
+    def _evaluate_challenge(self, ear: float, yaw: float):
+        """Check current gesture against the active challenge."""
+        if self.current_challenge_idx >= len(self.challenges):
+            self.passed = True
+            self.instruction = "تم التحقق"
+            return
+
+        # Timeout per challenge
+        elapsed = time.time() - self.challenge_start
+        if elapsed > CHALLENGE_TIMEOUT:
+            self.failed = True
+            self.instruction = "انتهى وقت التحدي"
+            return
+
+        challenge = self.challenges[self.current_challenge_idx]
+        matched = False
+
+        if challenge == "BLINK":
+            threshold = self.ear_baseline * BLINK_RATIO
+            matched = ear < threshold
+        elif challenge == "TURN_LEFT":
+            # Yaw becomes more negative when turning left
+            matched = (yaw - self.yaw_neutral) < -TURN_YAW_DEG
+        elif challenge == "TURN_RIGHT":
+            matched = (yaw - self.yaw_neutral) > TURN_YAW_DEG
+
+        if matched:
+            self.consecutive_count += 1
+        else:
+            self.consecutive_count = 0
+
+        if self.consecutive_count >= HYSTERESIS_FRAMES:
+            # Challenge passed!
+            logger.info("Session %s: %s passed", self.session_id, challenge)
+            self.current_challenge_idx += 1
+            self.consecutive_count = 0
+            self.challenge_start = time.time()
+
+            if self.current_challenge_idx >= len(self.challenges):
+                self.passed = True
+                self.instruction = "تم التحقق"
+            else:
+                self.instruction = self._challenge_instruction()
+        else:
+            # In progress
+            self.instruction = self._challenge_instruction()
+
+    def _challenge_instruction(self) -> str:
+        """Arabic instruction for the current challenge."""
+        if self.current_challenge_idx >= len(self.challenges):
+            return "تم التحقق"
+        c = self.challenges[self.current_challenge_idx]
+        if c == "BLINK":
+            return "أغمض عينيك"
+        elif c == "TURN_LEFT":
+            return "أدر وجهك إلى اليسار"
+        elif c == "TURN_RIGHT":
+            return "أدر وجهك إلى اليمين"
+        return "انظر إلى الكاميرا"
+
+    def _response(self) -> dict[str, Any]:
+        """Build the JSON response for the frontend."""
+        return {
+            "passed": self.passed,
+            "failed": self.failed,
+            "instruction": self.instruction,
+            "face_detected": self.face_detected,
+            "selfie_ready": self.passed,
+            "calibrated": self.calibrated,
+            "challenge": (
+                self.challenges[self.current_challenge_idx]
+                if not self.passed
+                and not self.failed
+                and self.current_challenge_idx < len(self.challenges)
+                else None
+            ),
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Global session registry + public API
+# ═══════════════════════════════════════════════════════════════════
+
+_sessions: dict[str, LivenessSession] = {}
 
 
 def create_session(session_id: str, language: str = "ar") -> dict:
-    """Start a new active liveness session with randomized gesture challenges."""
-    from liveness_detector.server_launcher import GestureServerClient
-
+    """Start a new isolated liveness session."""
     if session_id in _sessions:
         cleanup_session(session_id)
-
-    # Randomized challenge order
-    import random
-
-    gestures = ["blink", "faceFrontLeft", "faceFrontRight", "smile"]
-    random.shuffle(gestures)
-    gestures = gestures[:3]  # pick 3
-
-    client = GestureServerClient(
-        language=language,
-        socket_path=f"/tmp/liveness_{session_id}",
-        num_gestures=3,
-        gestures_list=gestures,
-    )
-
-    state: dict[str, Any] = {
-        "client": client,
-        "passed": False,
-        "failed": False,
-        "instruction": "انظر إلى الكاميرا"
-        if language == "ar"
-        else "Look at the camera",
-        "best_frame": None,
-        "best_quality": 0.0,
-        "frame_count": 0,
-        "spoof_score": 1.0,
-        "start_time": time.time(),
-        "selfie_path": None,
-    }
-
-    def on_instruction(message: str):
-        state["instruction"] = message
-        logger.info("Liveness [%s]: %s", session_id, message)
-
-    def on_result(alive: bool):
-        state["passed"] = alive
-        state["failed"] = not alive
-        logger.info("Liveness result [%s]: %s", session_id, alive)
-
-    client.set_string_callback(on_instruction)
-    client.set_report_alive_callback(on_result)
-    client.start_server()
-
-    _sessions[session_id] = state
-    logger.info("Liveness session %s created — gestures: %s", session_id, gestures)
-
+    _sessions[session_id] = LivenessSession(session_id)
     return {"started": True, "session_id": session_id}
 
 
-def process_liveness_frame(
-    frame: np.ndarray,
-    session_id: str,
-) -> dict[str, Any]:
-    """Process one camera frame through passive + active liveness pipeline.
-
-    Called per WebSocket frame. Returns UI state for frontend overlay.
-    """
+def process_liveness_frame(frame: np.ndarray, session_id: str) -> dict[str, Any]:
+    """Process one camera frame. Returns UI state."""
     if session_id not in _sessions:
         create_session(session_id)
+    sess = _sessions[session_id]
+    result = sess.process(frame)
 
-    state = _sessions[session_id]
-    state["frame_count"] += 1
-
-    # ── Timeout check ──────────────────────────────────────────
-    elapsed = time.time() - state["start_time"]
-    if elapsed > MAX_TIMEOUT_SECONDS and not state["passed"]:
-        state["failed"] = True
-
-    if state["failed"]:
-        return {
-            "passed": False,
-            "failed": True,
-            "instruction": "انتهت المهلة — الرجاء المحاولة مرة أخرى",
-            "face_detected": False,
-            "spoof_score": round(state["spoof_score"], 4),
-        }
-
-    if state["passed"]:
-        return {
-            "passed": True,
-            "failed": False,
-            "instruction": "تم التحقق",
-            "selfie_ready": True,
-            "spoof_score": round(state["spoof_score"], 4),
-        }
-
-    # ── Stage 1: passive anti-spoofing ──────────────────────────
-    # Disabled — ONNX DeepPixBiS requires tight face crop.
-    # Active gestures (blink/head turn/smile) already provide
-    # strong liveness — impossible to fake with a photo.
-    # To re-enable: extract face bbox, crop, then call check_spoof().
-
-    # ── Stage 2: active gesture challenge ───────────────────────
-    client = state["client"]
-    client.process_frame(frame)
-
-    # Track best frame for selfie
-    if not state["passed"]:
-        quality = _frame_quality(frame)
-        if quality > state["best_quality"]:
-            state["best_quality"] = quality
-            state["best_frame"] = frame.copy()
-            # Persist to temp file (survives uvicorn reload)
-            old = state.get("selfie_path")
+    # Save best frame for selfie
+    if not sess.passed and sess.face_detected:
+        q = _frame_quality(frame)
+        if q > sess.best_quality:
+            sess.best_quality = q
+            sess.best_frame = frame.copy()
+            old = sess.selfie_path
             if old and os.path.exists(old):
                 try:
                     os.remove(old)
@@ -210,60 +482,44 @@ def process_liveness_frame(
             fd, path = tempfile.mkstemp(suffix=".jpg", prefix="selfie_")
             os.close(fd)
             cv2.imwrite(path, frame)
-            state["selfie_path"] = path
+            sess.selfie_path = path
 
-    return {
-        "passed": state["passed"],
-        "failed": state["failed"],
-        "instruction": state["instruction"],
-        "face_detected": True,
-        "spoof_score": round(state["spoof_score"], 4),
-    }
+    return result
 
 
 def get_selfie_frame(session_id: str) -> np.ndarray | None:
-    """Return best captured selfie frame for face matching."""
-    state = _sessions.get(session_id)
-    if not state:
+    """Return best captured selfie for face matching."""
+    sess = _sessions.get(session_id)
+    if not sess:
         return None
-    frame = state.get("best_frame")
-    if frame is not None:
-        return frame
-    path = state.get("selfie_path")
-    if path and os.path.exists(path):
-        frame = cv2.imread(path)
-        if frame is not None:
-            state["best_frame"] = frame
-            return frame
+    if sess.best_frame is not None:
+        return sess.best_frame
+    if sess.selfie_path and os.path.exists(sess.selfie_path):
+        return cv2.imread(sess.selfie_path)
     return None
 
 
 def cleanup_session(session_id: str) -> None:
-    """Stop gesture server, remove temp files, clear state."""
-    state = _sessions.pop(session_id, None)
-    if state is None:
-        return
-    try:
-        state["client"].stop_server()
-    except Exception as exc:
-        logger.warning("Error stopping liveness server: %s", exc)
-    path = state.get("selfie_path")
-    if path and os.path.exists(path):
+    """Remove session and temp files."""
+    sess = _sessions.pop(session_id, None)
+    if sess and sess.selfie_path and os.path.exists(sess.selfie_path):
         try:
-            os.remove(path)
+            os.remove(sess.selfie_path)
         except OSError:
             pass
 
 
 def _frame_quality(frame: np.ndarray) -> float:
-    """Laplacian variance — higher = sharper face."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
-# ── Face matching (unchanged) ──────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# Face matching (unchanged)
+# ═══════════════════════════════════════════════════════════════════
+
+
 def match_faces(cin_face: np.ndarray, selfie: np.ndarray) -> dict:
-    """Compare CIN face crop against the captured selfie using DeepFace."""
     try:
         from deepface import DeepFace
 
@@ -286,7 +542,6 @@ def match_faces(cin_face: np.ndarray, selfie: np.ndarray) -> dict:
             threshold = float(result.get("threshold", 0.4))
             matched = distance < threshold
             score = max(0.0, 1.0 - (distance / max(threshold * 2, 1.0)))
-
             return {
                 "match": matched,
                 "score": round(score, 4),
@@ -307,5 +562,5 @@ def match_faces(cin_face: np.ndarray, selfie: np.ndarray) -> dict:
             "score": 0.0,
             "threshold": 0.4,
             "distance": 1.0,
-            "reason": f"Face matching error: {exc}",
+            "reason": f"Error: {exc}",
         }

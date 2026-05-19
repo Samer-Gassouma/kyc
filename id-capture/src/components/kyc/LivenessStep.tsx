@@ -1,7 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import { useCamera } from "@/hooks/useCamera";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { canvasToJpegBlob, grabFrame } from "@/lib/frameEncoder";
 import { API_BASE, getWsUrl } from "@/lib/apiBase";
 import clsx from "clsx";
@@ -30,11 +29,12 @@ interface LivenessResponse {
   instruction: string;
   face_detected?: boolean;
   spoof_detected?: boolean;
-  spoof_score?: number;
   selfie_ready?: boolean;
+  calibrated?: boolean;
+  challenge?: string | null;
 }
 
-type LivenessState = "connecting" | "running" | "passed" | "failed" | "spoof";
+type LivenessState = "connecting" | "calibrating" | "running" | "passed" | "failed";
 
 export default function LivenessStep({
   token,
@@ -42,167 +42,188 @@ export default function LivenessStep({
   frontCaptureId,
   onComplete,
 }: LivenessStepProps) {
-  const {
-    videoRef,
-    isReady,
-    error: camError,
-    start,
-    stop,
-  } = useCamera({
-    facingMode: "user",
-    width: 640,
-    height: 480,
-  });
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const animRef = useRef<number | null>(null);
+  const onCompleteRef = useRef(onComplete);
+  onCompleteRef.current = onComplete;
 
   const [livenessState, setLivenessState] =
     useState<LivenessState>("connecting");
   const [instruction, setInstruction] = useState("انظر إلى الكاميرا");
   const [faceDetected, setFaceDetected] = useState(false);
   const [finalizing, setFinalizing] = useState(false);
-  const [spoofScore, setSpoofScore] = useState<number>(1.0);
-  const [reconnectKey, setReconnectKey] = useState(0);
-  const onCompleteRef = useRef(onComplete);
-  onCompleteRef.current = onComplete;
+  const [camError, setCamError] = useState<string | null>(null);
 
-  const wsRef = useRef<WebSocket | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const loopRef = useRef<number | null>(null);
-
-  // Start camera
+  // ── Single unified effect: camera → websocket → frames → cleanup ─
   useEffect(() => {
-    canvasRef.current = document.createElement("canvas");
-    start();
-    return () => {
-      stop();
+    if (!sessionId) return;
+
+    let stopped = false;
+    const canvas = document.createElement("canvas");
+    canvasRef.current = canvas;
+
+    const cleanup = () => {
+      stopped = true;
       wsRef.current?.close();
-      if (loopRef.current) cancelAnimationFrame(loopRef.current);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Connect WebSocket when camera ready
-  useEffect(() => {
-    if (!isReady || !sessionId) return;
-
-    const wsUrl = getWsUrl(`/ws/liveness/${sessionId}`);
-    const ws = new WebSocket(wsUrl);
-    ws.binaryType = "arraybuffer";
-    wsRef.current = ws;
-
-    ws.onopen = () => {
-      setLivenessState("running");
-      setInstruction("انظر إلى الكاميرا");
+      wsRef.current = null;
+      if (animRef.current) cancelAnimationFrame(animRef.current);
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
     };
 
-    ws.onmessage = (event) => {
+    const startCamera = async () => {
       try {
-        const data: LivenessResponse = JSON.parse(event.data);
-
-        setFaceDetected(data.face_detected ?? true);
-        setInstruction(data.instruction);
-        if (data.spoof_score !== undefined) setSpoofScore(data.spoof_score);
-
-        if (data.spoof_detected) {
-          setLivenessState("spoof");
-          ws.close();
-          if (loopRef.current) cancelAnimationFrame(loopRef.current);
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: "user",
+            width: { ideal: 640 },
+            height: { ideal: 480 },
+          },
+          audio: false,
+        });
+        if (stopped) {
+          stream.getTracks().forEach((t) => t.stop());
           return;
         }
+        streamRef.current = stream;
 
-        if (data.passed) {
-          setLivenessState("passed");
-          ws.close();
-          if (loopRef.current) cancelAnimationFrame(loopRef.current);
-
-          setFinalizing(true);
-          const formData = new FormData();
-          if (frontCaptureId)
-            formData.append("front_capture_id", frontCaptureId);
-          fetch(`${API_BASE}/api/kyc/finalize/${sessionId}`, {
-            method: "POST",
-            headers: { Authorization: `Bearer ${token}` },
-            body: formData,
-          })
-            .then((r) => r.json())
-            .then((result) => {
-              setFinalizing(false);
-              onCompleteRef.current(result.kyc_passed);
-            })
-            .catch(() => {
-              setFinalizing(false);
-              onCompleteRef.current(false);
-            });
+        // Need a video element for the stream
+        let video = videoRef.current;
+        if (!video) {
+          video = document.createElement("video");
+          video.setAttribute("playsinline", "");
+          videoRef.current = video;
         }
+        video.srcObject = stream;
+        await video.play();
 
-        if (data.failed) {
-          setLivenessState("failed");
-          ws.close();
-          if (loopRef.current) cancelAnimationFrame(loopRef.current);
+        if (stopped) return;
+
+        // ── Now open WebSocket ──
+        const wsUrl = getWsUrl(`/ws/liveness/${sessionId}`);
+        const ws = new WebSocket(wsUrl);
+        ws.binaryType = "arraybuffer";
+        wsRef.current = ws;
+
+        ws.onopen = () => {
+          if (stopped) {
+            ws.close();
+            return;
+          }
+          setLivenessState("running");
+          setInstruction("انظر إلى الكاميرا");
+          startFrameLoop(video!, canvas, ws);
+        };
+
+        ws.onmessage = (event) => {
+          if (stopped) return;
+          try {
+            const data: LivenessResponse = JSON.parse(event.data);
+            setFaceDetected(data.face_detected ?? true);
+            setInstruction(data.instruction);
+
+            if (data.calibrated === false) {
+              setLivenessState("calibrating");
+            } else if (data.calibrated) {
+              setLivenessState("running");
+            }
+            if (data.passed) {
+              setLivenessState("passed");
+              setFinalizing(true);
+              const fd = new FormData();
+              if (frontCaptureId) fd.append("front_capture_id", frontCaptureId);
+              fetch(`${API_BASE}/api/kyc/finalize/${sessionId}`, {
+                method: "POST",
+                headers: { Authorization: `Bearer ${token}` },
+                body: fd,
+              })
+                .then((r) => r.json())
+                .then((res) => onCompleteRef.current(res.kyc_passed))
+                .catch(() => onCompleteRef.current(false))
+                .finally(() => setFinalizing(false));
+              cleanup();
+              return;
+            }
+            if (data.failed) {
+              setLivenessState("failed");
+              cleanup();
+            }
+          } catch {
+            /* ignore */
+          }
+        };
+
+        ws.onerror = () => setInstruction("خطأ في الاتصال");
+        ws.onclose = () => {
+          if (!stopped && livenessState === "running")
+            setInstruction("انقطع الاتصال");
+        };
+      } catch (err) {
+        if (!stopped) {
+          setCamError(
+            err instanceof Error ? err.message : "Camera access denied",
+          );
         }
-      } catch {
-        // ignore parse errors
       }
     };
 
-    ws.onerror = () => setInstruction("خطأ في الاتصال — إعادة المحاولة...");
-    ws.onclose = () => {
-      if (livenessState === "running") setInstruction("انقطع الاتصال");
-    };
+    startCamera();
+    return cleanup;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId]);
 
-    return () => {
-      ws.close();
-    };
-  }, [isReady, sessionId, token, reconnectKey]);
-
-  // Frame sending loop — 10fps
-  useEffect(() => {
-    if (!isReady || livenessState !== "running") return;
-
+  // ── Frame loop ──────────────────────────────────────────────
+  const startFrameLoop = (
+    video: HTMLVideoElement,
+    canvas: HTMLCanvasElement,
+    ws: WebSocket,
+  ) => {
     let lastSend = 0;
     const INTERVAL = 100;
 
     const loop = () => {
+      if (ws.readyState !== WebSocket.OPEN) return;
       const now = Date.now();
-      if (
-        now - lastSend >= INTERVAL &&
-        wsRef.current?.readyState === WebSocket.OPEN &&
-        videoRef.current &&
-        canvasRef.current
-      ) {
+      if (now - lastSend >= INTERVAL && video.readyState >= 2) {
         lastSend = now;
-        grabFrame(videoRef.current, canvasRef.current);
-        canvasToJpegBlob(canvasRef.current, 0.7).then((blob) => {
+        grabFrame(video, canvas);
+        canvasToJpegBlob(canvas, 0.7).then((blob) => {
           blob.arrayBuffer().then((buf) => {
-            if (wsRef.current?.readyState === WebSocket.OPEN) {
-              wsRef.current.send(buf);
-            }
+            if (ws.readyState === WebSocket.OPEN) ws.send(buf);
           });
         });
       }
-      loopRef.current = requestAnimationFrame(loop);
+      animRef.current = requestAnimationFrame(loop);
     };
 
-    loopRef.current = requestAnimationFrame(loop);
-    return () => {
-      if (loopRef.current) cancelAnimationFrame(loopRef.current);
-    };
-  }, [isReady, livenessState, videoRef]);
+    animRef.current = requestAnimationFrame(loop);
+  };
+
+  // ── Retry handler ───────────────────────────────────────────
+  const handleRetry = useCallback(async () => {
+    await fetch(`${API_BASE}/api/liveness/reset/${sessionId}`, {
+      method: "POST",
+    });
+    window.location.reload();
+  }, [sessionId]);
 
   // ── Gesture icon ────────────────────────────────────────────
   const getGestureIcon = () => {
-    const txt = instruction.toLowerCase();
-    if (txt.includes("اغمض") || txt.includes("blink"))
+    const txt = instruction;
+    if (txt.includes("أغمض") || txt.includes("blink") || txt.includes("Blink"))
       return <EyeOff className="h-8 w-8 animate-pulse" />;
-    if (txt.includes("يسار") || txt.includes("left"))
+    if (txt.includes("يسار") || txt.includes("left") || txt.includes("Left"))
       return <ArrowLeft className="h-8 w-8 animate-bounce" />;
-    if (txt.includes("يمين") || txt.includes("right"))
+    if (txt.includes("يمين") || txt.includes("right") || txt.includes("Right"))
       return <ArrowRight className="h-8 w-8 animate-bounce" />;
-    if (txt.includes("ابتسم") || txt.includes("smile"))
+    if (txt.includes("ابتسم") || txt.includes("smile") || txt.includes("Smile"))
       return <Smile className="h-8 w-8 animate-pulse" />;
     return <Eye className="h-8 w-8" />;
   };
 
-  // ── Border color ────────────────────────────────────────────
   const getBorderColor = () => {
     switch (livenessState) {
       case "passed":
@@ -219,20 +240,18 @@ export default function LivenessStep({
 
   return (
     <div className="flex flex-col items-center gap-6">
-      {/* Camera error */}
       {camError && (
         <div className="flex flex-col items-center gap-3 p-8 text-center">
           <p className="text-sm text-red-400">{camError}</p>
           <button
-            onClick={start}
+            onClick={handleRetry}
             className="rounded-full bg-blue-600 px-4 py-2 text-sm text-white"
           >
-            Retry Camera
+            Retry
           </button>
         </div>
       )}
 
-      {/* Video + face oval */}
       <div
         className="relative w-full overflow-hidden rounded-2xl bg-black"
         style={{ maxWidth: 400 }}
@@ -245,8 +264,6 @@ export default function LivenessStep({
           className="h-full w-full object-cover"
           style={{ aspectRatio: "3/4", transform: "scaleX(-1)" }}
         />
-
-        {/* Face oval guide */}
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
           <div
             className={clsx(
@@ -264,9 +281,7 @@ export default function LivenessStep({
         </div>
       </div>
 
-      {/* Status area */}
       <div className="flex flex-col items-center gap-3 text-center">
-        {/* Running: show instruction + gesture icon */}
         {livenessState === "running" && (
           <>
             <div className="flex items-center gap-2 text-lg font-medium text-white">
@@ -281,7 +296,6 @@ export default function LivenessStep({
           </>
         )}
 
-        {/* Spoof detected */}
         {livenessState === "spoof" && (
           <>
             <div className="flex items-center gap-2 rounded-full bg-red-600 px-5 py-2.5 text-sm font-medium text-white">
@@ -292,7 +306,6 @@ export default function LivenessStep({
           </>
         )}
 
-        {/* Passed */}
         {livenessState === "passed" && (
           <>
             <div className="flex items-center gap-2 rounded-full bg-green-600 px-5 py-2.5 text-sm font-medium text-white">
@@ -308,25 +321,21 @@ export default function LivenessStep({
           </>
         )}
 
-        {/* Failed */}
         {(livenessState === "failed" || livenessState === "spoof") && (
           <button
-            onClick={async () => {
-              await fetch(`${API_BASE}/api/liveness/reset/${sessionId}`, {
-                method: "POST",
-              });
-              setReconnectKey((k) => k + 1);
-              setLivenessState("running");
-              setInstruction("انظر إلى الكاميرا");
-              start();
-            }}
+            onClick={handleRetry}
             className="rounded-full bg-blue-600 px-6 py-2.5 text-sm font-medium text-white hover:bg-blue-500"
           >
             إعادة المحاولة
           </button>
         )}
 
-        {/* Connecting */}
+        {livenessState === "calibrating" && (
+          <div className="flex items-center gap-2 text-sm text-blue-400">
+            <Loader2 className="h-4 w-4 animate-spin" /><span>جاري المعايرة...</span>
+          </div>
+        )}
+
         {livenessState === "connecting" && (
           <div className="flex items-center gap-2 text-sm text-zinc-400">
             <Loader2 className="h-4 w-4 animate-spin" />

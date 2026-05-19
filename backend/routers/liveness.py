@@ -36,14 +36,10 @@ async def ws_liveness(websocket: WebSocket, session_id: str):
     Frames sent from browser at ~10fps. Server runs gesture detection
     and returns real-time instructions + final pass/fail.
     """
-    import asyncio as _asyncio
-
-    # Start gesture server BEFORE accepting (takes ~2s, avoid browser timeout)
-    loop = _asyncio.get_event_loop()
-    await loop.run_in_executor(None, create_session, session_id)
-
     await websocket.accept()
     logger.info("Liveness WebSocket connected session=%s", session_id)
+
+    create_session(session_id)
 
     try:
         while True:

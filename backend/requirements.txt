@@ -18,7 +18,6 @@ torchvision==0.16.2
 opencv-python-headless==4.8.1.78
 numpy==1.26.2
 easyocr==1.7.1
-liveness-detector==0.7.0
 passporteye==2.1.0
 deepface==0.0.93
 tf-keras==2.21.0
