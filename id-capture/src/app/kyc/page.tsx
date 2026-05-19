@@ -11,12 +11,13 @@ const LivenessStep = dynamic(() => import("@/components/kyc/LivenessStep"), {
 
 interface KYCResult {
   kyc_passed: boolean;
-  face_match_score?: number | null;
-  face_match_possible?: boolean;
-  cin_fields?: Record<string, string>;
-  reason?: string;
   status?: string;
   message?: string;
+  data?: Record<string, any>;
+  face_crop_url?: string | null;
+  face_match?: { match: boolean; score: number; reason: string } | null;
+  liveness_passed?: boolean;
+  error?: string;
 }
 
 export default function KYCPage() {
@@ -142,30 +143,40 @@ export default function KYCPage() {
               ? "Verification Complete"
               : "Verification Failed"}
           </h2>
-          <p className="text-sm text-zinc-400">{result.reason}</p>
+          <p className="text-sm text-zinc-400">{result.face_match?.reason || result.message || (result.kyc_passed ? "Verification passed" : "Verification failed")}</p>
 
-          {result.cin_fields && Object.keys(result.cin_fields).length > 0 && (
+          {result.data && Object.keys(result.data).length > 0 && (
             <div className="w-full max-w-md rounded-xl bg-zinc-900 p-4">
               <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider text-zinc-400">
                 Extracted CIN Fields
               </h3>
               <dl className="grid grid-cols-2 gap-2 text-sm">
-                {Object.entries(result.cin_fields).map(([k, v]) => (
+                {Object.entries(result.data).filter(([k]) => k !== "barcode").map(([k, v]) => (
                   <div key={k}>
                     <dt className="text-xs text-zinc-500">{k}</dt>
-                    <dd className="font-medium">{String(v)}</dd>
+                    <dd className="font-medium">{typeof v === "object" ? JSON.stringify(v) : String(v)}</dd>
                   </div>
                 ))}
               </dl>
             </div>
           )}
 
-          {result.face_match_score !== null &&
-            result.face_match_score !== undefined && (
-              <p className="text-sm text-zinc-400">
-                Face match: {(result.face_match_score * 100).toFixed(0)}%
-              </p>
-            )}
+          {result.face_crop_url && (
+            <div className="w-full max-w-md">
+              <p className="mb-2 text-xs text-zinc-400">Face Crop from CIN:</p>
+              <img
+                src={`${API_BASE}${result.face_crop_url}`}
+                alt="CIN Face"
+                className="h-32 w-32 rounded-xl border-2 border-green-400 object-cover"
+              />
+            </div>
+          )}
+
+          {result.face_match && (
+            <p className="text-sm text-zinc-400">
+              Face match: {(result.face_match.score * 100).toFixed(0)}% — {result.face_match.reason}
+            </p>
+          )}
 
           <button
             onClick={() => window.location.reload()}

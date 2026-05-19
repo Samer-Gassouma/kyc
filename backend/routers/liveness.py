@@ -210,15 +210,12 @@ async def kyc_finalize(
     session_id: str,
     _user: dict = Depends(get_current_user_or_api_key),
 ) -> dict:
-    """Called after liveness passes. Runs face match against CIN photo.
-    Returns only when CIN extraction is also complete."""
+    """Called after liveness passes. Returns same structure as extract endpoint."""
+    from core.auth import create_token
+
     db = SessionLocal()
     try:
         selfie = get_selfie_frame(session_id)
-        if selfie is None:
-            raise HTTPException(400, "Liveness not completed")
-
-        # Check CIN extraction status
         ext = db.query(ExtractionSession).filter_by(id=session_id).first()
         if not ext:
             raise HTTPException(404, "KYC session not found")
@@ -229,78 +226,69 @@ async def kyc_finalize(
         if ext.status != "completed":
             return {
                 "session_id": session_id,
-                "kyc_passed": False,
                 "status": "processing",
                 "message": "CIN extraction still in progress. Poll /api/kyc/status for results.",
             }
 
-        # CIN extraction done — get face crop
+        # Build same output as extract endpoint
+        merged: dict = {}
+        if ext.merged_fields:
+            try: merged = json.loads(ext.merged_fields)
+            except json.JSONDecodeError: pass
+
+        face_crop_url = None
+        if ext.front_capture_id:
+            cap = db.query(Capture).filter_by(id=ext.front_capture_id).first()
+            if cap:
+                # Check for face crop (S3 or base64)
+                has_face = (cap.face_crop_s3_key or ext.face_crop_base64)
+                if has_face:
+                    fc_token = create_token(session_id, {"type": "kyc_session"})
+                    face_crop_url = (
+                        f"/api/capture/{ext.front_capture_id}/face-crop?token={fc_token}"
+                    )
+
+        # Face match
         cin_face = None
         if ext.front_capture_id:
             cap = db.query(Capture).filter_by(id=ext.front_capture_id).first()
             if cap and cap.face_crop_s3_key:
                 try:
-                    face_bytes = download_decrypted(cap.face_crop_s3_key)
-                    arr = np.frombuffer(face_bytes, dtype=np.uint8)
-                    cin_face = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                except Exception:
-                    pass
-
-        # Fallback: try base64 from merged fields
+                    fb = download_decrypted(cap.face_crop_s3_key)
+                    cin_face = cv2.imdecode(np.frombuffer(fb, dtype=np.uint8), cv2.IMREAD_COLOR)
+                except Exception: pass
         if cin_face is None and ext.face_crop_base64:
-            import base64
-
             try:
-                cin_bytes = base64.b64decode(ext.face_crop_base64)
-                arr = np.frombuffer(cin_bytes, dtype=np.uint8)
-                cin_face = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            except Exception:
-                pass
+                import base64
+                cin_face = cv2.imdecode(np.frombuffer(base64.b64decode(ext.face_crop_base64), dtype=np.uint8), cv2.IMREAD_COLOR)
+            except Exception: pass
 
-        if cin_face is None:
-            # No face to match — pass liveness-only if CIN extraction worked
-            merged = {}
-            if ext.merged_fields:
-                try:
-                    merged = json.loads(ext.merged_fields)
-                except json.JSONDecodeError:
-                    pass
-            cleanup_session(session_id)
-            return {
-                "session_id": session_id,
-                "kyc_passed": True,
-                "face_match_score": None,
-                "face_match_possible": False,
-                "cin_fields": merged,
-                "reason": "Liveness passed, CIN extracted, face match skipped (no photo found)",
-            }
+        face_match = None
+        if cin_face is not None and selfie is not None:
+            face_match = match_faces(cin_face, selfie)
 
-        match_result = match_faces(cin_face, selfie)
-
-        # Update DB
         ls = db.query(LivenessSession).filter_by(id=session_id).first()
         if ls:
             ls.liveness_passed = True
-            ls.face_match_score = match_result["score"]
-            ls.status = "completed" if match_result["match"] else "failed"
+            if face_match:
+                ls.face_match_score = face_match["score"]
+            ls.status = "completed"
             db.commit()
 
-        merged = {}
-        if ext.merged_fields:
-            try:
-                merged = json.loads(ext.merged_fields)
-            except json.JSONDecodeError:
-                pass
+        kyc_passed = True  # CIN extracted + liveness passed = success
+        if face_match:
+            kyc_passed = face_match["match"]
 
         cleanup_session(session_id)
 
         return {
             "session_id": session_id,
-            "kyc_passed": match_result["match"],
-            "face_match_score": match_result["score"],
-            "face_match_threshold": match_result.get("threshold", 0.4),
-            "cin_fields": merged,
-            "reason": match_result["reason"],
+            "status": "completed",
+            "kyc_passed": kyc_passed,
+            "data": merged,
+            "face_crop_url": face_crop_url,
+            "face_match": face_match,
+            "liveness_passed": True,
         }
     finally:
         db.close()
@@ -316,33 +304,36 @@ async def kyc_status(
     session_id: str,
     _user: dict = Depends(get_current_user_or_api_key),
 ) -> dict:
-    """Get combined KYC status: CIN extraction + liveness state."""
+    """Get combined KYC status — same structure as extract + finalize."""
+    from core.auth import create_token
+
     db = SessionLocal()
     try:
         ext = db.query(ExtractionSession).filter_by(id=session_id).first()
         ls = db.query(LivenessSession).filter_by(id=session_id).first()
 
         cin_status = ext.status if ext else "unknown"
-        cin_fields = {}
+        data = {}
         if ext and ext.merged_fields:
-            try:
-                cin_fields = json.loads(ext.merged_fields)
-            except json.JSONDecodeError:
-                pass
+            try: data = json.loads(ext.merged_fields)
+            except json.JSONDecodeError: pass
 
-        liveness_passed = ls.liveness_passed if ls else False
-        face_match_score = ls.face_match_score if ls else None
-
-        kyc_passed = cin_status == "completed" and liveness_passed
+        face_crop_url = None
+        if ext and ext.front_capture_id:
+            cap = db.query(Capture).filter_by(id=ext.front_capture_id).first()
+            if cap and (cap.face_crop_s3_key or ext.face_crop_base64):
+                fc_token = create_token(session_id, {"type": "kyc_session"})
+                face_crop_url = f"/api/capture/{ext.front_capture_id}/face-crop?token={fc_token}"
 
         return {
             "session_id": session_id,
-            "cin_status": cin_status,
-            "cin_fields": cin_fields,
-            "liveness_passed": liveness_passed,
-            "face_match_score": face_match_score,
-            "kyc_passed": kyc_passed,
-            "cin_error": ext.error_reason if ext and ext.status == "failed" else None,
+            "status": cin_status,
+            "data": data,
+            "face_crop_url": face_crop_url,
+            "liveness_passed": ls.liveness_passed if ls else False,
+            "face_match_score": ls.face_match_score if ls else None,
+            "kyc_passed": cin_status == "completed" and (ls.liveness_passed if ls else False),
+            "error": ext.error_reason if ext and ext.status == "failed" else None,
         }
     finally:
         db.close()
