@@ -204,7 +204,7 @@ export default function LivenessStep({
     const loop = () => {
       if (ws.readyState !== WebSocket.OPEN) return;
       const now = Date.now();
-      if (now - lastSend >= INTERVAL && video.readyState >= 2) {
+      if (now - lastSend >= INTERVAL) {
         lastSend = now;
         grabFrame(video, canvas);
         canvasToJpegBlob(canvas, 0.7).then((blob) => {
