@@ -34,14 +34,15 @@ interface LivenessResponse {
   progress?: number;
   selfie_url?: string | null;
   face_bbox?: number[] | null;
-  face_landmarks?: {x: number; y: number}[] | null;
+  face_landmarks?: { x: number; y: number }[] | null;
 }
 
-type LivenessState = "connecting" | "calibrating" | "running" | "passed" | "failed";
-
-
-
-
+type LivenessState =
+  | "connecting"
+  | "calibrating"
+  | "running"
+  | "passed"
+  | "failed";
 
 export default function LivenessStep({
   token,
@@ -53,8 +54,6 @@ export default function LivenessStep({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const livenessStateRef = useRef("connecting");
-  livenessStateRef.current = livenessState;
   const animRef = useRef<number | null>(null);
   const onCompleteRef = useRef(onComplete);
   onCompleteRef.current = onComplete;
@@ -66,10 +65,14 @@ export default function LivenessStep({
   const [finalizing, setFinalizing] = useState(false);
   const [camError, setCamError] = useState<string | null>(null);
   const [selfieUrl, setSelfieUrl] = useState<string | null>(null);
-  const [faceLandmarks, setFaceLandmarks] = useState<{x: number; y: number}[] | null>(null);
+  const [faceLandmarks, setFaceLandmarks] = useState<
+    { x: number; y: number }[] | null
+  >(null);
   const [progress, setProgress] = useState(0);
   const [progressNeeded, setProgressNeeded] = useState(2);
   const [faceBBox, setFaceBBox] = useState<number[] | null>(null);
+  const livenessStateRef = useRef(livenessState);
+  livenessStateRef.current = livenessState;
 
   // ── Single unified effect: camera → websocket → frames → cleanup ─
   useEffect(() => {
@@ -123,7 +126,10 @@ export default function LivenessStep({
         wsRef.current = ws;
 
         ws.onopen = () => {
-          if (stopped) { ws.close(); return; }
+          if (stopped) {
+            ws.close();
+            return;
+          }
           setLivenessState("running");
           setInstruction("انظر إلى الكاميرا");
           startFrameLoop(video!, canvas, ws);
@@ -186,7 +192,8 @@ export default function LivenessStep({
         ws.onerror = () => setInstruction("خطأ في الاتصال");
       } catch (err) {
         if (!stopped) {
-          const msg = err instanceof Error ? err.message : "Camera access denied";
+          const msg =
+            err instanceof Error ? err.message : "Camera access denied";
           setCamError(msg);
           setInstruction("تعذر الوصول إلى الكاميرا");
           setLivenessState("failed");
@@ -316,7 +323,9 @@ export default function LivenessStep({
               <div className="h-1.5 w-48 overflow-hidden rounded-full bg-zinc-700">
                 <div
                   className="h-full rounded-full bg-green-400 transition-all duration-200"
-                  style={{ width: `${Math.min(100, (progress / progressNeeded) * 100)}%` }}
+                  style={{
+                    width: `${Math.min(100, (progress / progressNeeded) * 100)}%`,
+                  }}
                 />
               </div>
             )}
@@ -339,15 +348,15 @@ export default function LivenessStep({
         )}
 
         {livenessState === "passed" && selfieUrl && (
-            <div className="mb-4 overflow-hidden rounded-xl border-2 border-green-400">
-              <img
-                src={`${API_BASE}${selfieUrl}`}
-                alt="Selfie"
-                className="h-48 w-full object-cover"
-              />
-            </div>
-          )}
-          {livenessState === "passed" && (
+          <div className="mb-4 overflow-hidden rounded-xl border-2 border-green-400">
+            <img
+              src={`${API_BASE}${selfieUrl}`}
+              alt="Selfie"
+              className="h-48 w-full object-cover"
+            />
+          </div>
+        )}
+        {livenessState === "passed" && (
           <>
             <div className="flex items-center gap-2 rounded-full bg-green-600 px-5 py-2.5 text-sm font-medium text-white">
               <CheckCircle className="h-5 w-5" />
@@ -373,7 +382,8 @@ export default function LivenessStep({
 
         {livenessState === "calibrating" && (
           <div className="flex items-center gap-2 text-sm text-blue-400">
-            <Loader2 className="h-4 w-4 animate-spin" /><span>جاري المعايرة...</span>
+            <Loader2 className="h-4 w-4 animate-spin" />
+            <span>جاري المعايرة...</span>
           </div>
         )}
 
