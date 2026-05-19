@@ -61,6 +61,8 @@ export default function LivenessStep({
   const [finalizing, setFinalizing] = useState(false);
   const [spoofScore, setSpoofScore] = useState<number>(1.0);
   const [reconnectKey, setReconnectKey] = useState(0);
+  const onCompleteRef = useRef(onComplete);
+  onCompleteRef.current = onComplete;
 
   const wsRef = useRef<WebSocket | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -124,11 +126,11 @@ export default function LivenessStep({
             .then((r) => r.json())
             .then((result) => {
               setFinalizing(false);
-              onComplete(result.kyc_passed);
+              onCompleteRef.current(result.kyc_passed);
             })
             .catch(() => {
               setFinalizing(false);
-              onComplete(false);
+              onCompleteRef.current(false);
             });
         }
 
@@ -150,7 +152,7 @@ export default function LivenessStep({
     return () => {
       ws.close();
     };
-  }, [isReady, sessionId, token, onComplete, reconnectKey]);
+  }, [isReady, sessionId, token, reconnectKey]);
 
   // Frame sending loop — 10fps
   useEffect(() => {
