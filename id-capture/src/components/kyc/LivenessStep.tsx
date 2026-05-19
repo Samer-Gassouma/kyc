@@ -178,11 +178,9 @@ export default function LivenessStep({
             const data: LivenessResponse = JSON.parse(event.data);
             setFaceDetected(data.face_detected ?? true);
             setInstruction(data.instruction);
-            if (data.face_landmarks) setFaceLandmarks(data.face_landmarks);
             setProgress(data.progress ?? 0);
             if (data.selfie_url) setSelfieUrl(data.selfie_url);
             setProgressNeeded(100);
-            if (data.face_bbox) setFaceBBox(data.face_bbox);
 
             setLivenessState("running");
             if (data.passed) {
