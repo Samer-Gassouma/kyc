@@ -15,13 +15,12 @@ import cv2, numpy as np, onnxruntime as ort
 
 logger = logging.getLogger(__name__)
 _MODEL_DIR = Path(__file__).parent.parent.parent / "id-capture" / "public" / "models"
-MIN_FACE_SCORE = 0.35    # relaxed for low light
-LIVENESS_SCORE_MIN = 0.2  # relaxed for low light
+MIN_FACE_SCORE = 0.6    # relaxed for low light
+LIVENESS_SCORE_MIN = 0.5  # relaxed for low light
 NEEDED_FRAMES = 12        # faster pass
 TIMEOUT_SEC = 45           # longer timeout
 
 _sessions_cache: dict[str, ort.InferenceSession] = {}
-_haar_cascade: Any = None
 
 def _enhance(frame: np.ndarray) -> np.ndarray:
     """Auto-brightness + CLAHE — makes low-light frames usable."""
@@ -65,24 +64,19 @@ def _detect_face_dnn(frame: np.ndarray) -> tuple | None:
         return None
     return (*best_box, best_score)
 
-def _detect_face_haar(frame: np.ndarray) -> tuple | None:
-    global _haar_cascade
-    h, w = frame.shape[:2]
-    if _haar_cascade is None:
-        _haar_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = _haar_cascade.detectMultiScale(gray, 1.05, 4, minSize=(40, 40))
-    if len(faces) == 0:
-        return None
-    x, y, fw, fh = max(faces, key=lambda f: f[2] * f[3])
-    return (x, y, x + fw, y + fh, 0.6)
 
 def _detect_face(frame: np.ndarray) -> tuple | None:
-    """Two-stage detection: DNN first, Haar fallback."""
+    """DNN detection with size sanity check."""
     result = _detect_face_dnn(frame)
-    if result is not None:
-        return result
-    return _detect_face_haar(frame)
+    if result is None:
+        return None
+    x1, y1, x2, y2, score = result
+    h, w = frame.shape[:2]
+    fw, fh = x2 - x1, y2 - y1
+    # Face must be reasonable size: >60px and <85% of frame
+    if fw < 60 or fh < 60 or fw > w * 0.85 or fh > h * 0.85:
+        return None
+    return result
 
 def _check_liveness(frame: np.ndarray, bbox: tuple) -> float:
     sess = _get_session("fr_liveness")
