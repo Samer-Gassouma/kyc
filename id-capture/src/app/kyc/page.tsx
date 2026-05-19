@@ -110,7 +110,7 @@ export default function KYCPage() {
               setStep("done");
               setPolling(false);
             }
-          }, 2000);
+          }, 3000);
         } else {
           setResult(data);
           setStep("done");
