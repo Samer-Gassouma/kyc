@@ -575,18 +575,31 @@ def extract_card_fields(
             }
         )
 
-    # Phase 2: batch OCR on all text ROIs at once
+    # Phase 2: parallel OCR on all text ROIs via thread pool
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _ocr_one(idx: int, img: np.ndarray):
+        try:
+            return (idx, reader.readtext(
+                img, detail=1, paragraph=False,
+                text_threshold=0.5, low_text=0.3,
+            ))
+        except Exception as exc:
+            logger.error("EasyOCR failed on ROI %d: %s", idx, exc)
+            return (idx, [])
+
+    batch_results: list[list] = [[] for _ in ocr_meta]
     try:
-        batch_results = reader.readtext(
-            ocr_batch,
-            detail=1,
-            paragraph=False,
-            text_threshold=0.5,
-            low_text=0.3,
-        )
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {
+                pool.submit(_ocr_one, i, img): i
+                for i, img in enumerate(ocr_batch)
+            }
+            for future in as_completed(futures):
+                idx, results = future.result()
+                batch_results[idx] = results
     except Exception as exc:
-        logger.error("Batch EasyOCR failed: %s", exc)
-        batch_results = [[] for _ in ocr_meta]
+        logger.error("Parallel OCR failed: %s", exc)
 
     # Phase 3: build structured results per ROI
     raw_results: list[dict[str, Any]] = []
