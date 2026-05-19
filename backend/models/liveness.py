@@ -40,21 +40,28 @@ _LANDMARKER_PATH = _WEIGHTS_DIR / "face_landmarker_v2_with_blendshapes.task"
 sys.path.insert(0, str(_VENDOR_DIR))
 
 # ── Constants ──────────────────────────────────────────────────────
-CALIBRATION_FRAMES = 30  # frames to establish per-user baseline
-HYSTERESIS_FRAMES = 5  # consecutive frames to confirm a gesture
-CHALLENGE_TIMEOUT = 10.0  # seconds per gesture challenge
+CALIBRATION_FRAMES = 20  # frames to establish per-user baseline
+HYSTERESIS_FRAMES = 3  # consecutive frames to confirm a gesture
+CHALLENGE_TIMEOUT = 15.0  # seconds per gesture challenge
 FPS_TARGET = 10  # expected WebSocket frame rate
-MIN_FACE_WIDTH_RATIO = 0.20  # face must cover >20% of frame width
+MIN_FACE_WIDTH_RATIO = 0.12  # face must cover >20% of frame width
 
 # Eye landmark indices (MediaPipe 468-mesh)
 LEFT_EYE_IDX = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE_IDX = [362, 385, 387, 263, 373, 380]
 
+# Key landmarks for frontend visualization (indices in 468-mesh)
+FACE_OVAL_IDX = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109]
+MOUTH_IDX = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95]
+NOSE_IDX = [1, 2, 98, 327]
+EYE_L_IDX = [33, 133, 160, 159, 158, 144, 153, 154, 155]
+EYE_R_IDX = [362, 263, 387, 386, 385, 373, 380, 381, 382]
+
 # Blink: EAR drops below baseline * BLINK_RATIO
-BLINK_RATIO = 0.72
+BLINK_RATIO = 0.65
 
 # Head turn: |yaw| exceeds TURN_YAW_DEG from baseline
-TURN_YAW_DEG = 18.0
+TURN_YAW_DEG = 15.0
 
 # MiniFASNet spoof threshold
 SPOOF_SCORE_THRESHOLD = 0.6
@@ -267,6 +274,12 @@ class LivenessSession:
         # Anti-spoof throttle
         self.last_spoof_check = 0
 
+        # Face tracking data for frontend visualization
+        self.face_bbox: tuple | None = None
+        self.face_landmarks_2d: list | None = None
+        self.face_yaw = 0.0
+        self.face_pitch = 0.0
+
         logger.info("Session %s: challenges = %s", session_id, self.challenges)
 
     # ── Per-frame processing ───────────────────────────────────
@@ -330,6 +343,17 @@ class LivenessSession:
             yaw, pitch, roll = _decompose_transform(
                 lm_result.facial_transformation_matrixes[0].data
             )
+
+        # Store face tracking data for frontend visualization
+        self.face_bbox = (x, y, fw, fh)
+        self.face_yaw = yaw
+        self.face_pitch = pitch
+        # Extract key 2D landmarks (normalised 0-1, then mapped to pixel coords)
+        key_indices = EYE_L_IDX + EYE_R_IDX + NOSE_IDX + MOUTH_IDX + FACE_OVAL_IDX[::4]  # sparse
+        self.face_landmarks_2d = [
+            {"x": round(landmarks[i].x * w, 1), "y": round(landmarks[i].y * h, 1)}
+            for i in key_indices if i < len(landmarks)
+        ]
 
         # ── Anti-spoof every 5th frame ─────────────────────────
         if self.frame_count - self.last_spoof_check >= 5:
@@ -442,6 +466,11 @@ class LivenessSession:
                 and self.current_challenge_idx < len(self.challenges)
                 else None
             ),
+            # Face tracking for frontend visualization
+            "face_bbox": list(self.face_bbox) if self.face_bbox else None,
+            "face_landmarks": self.face_landmarks_2d,
+            "face_yaw": round(self.face_yaw, 1),
+            "face_pitch": round(self.face_pitch, 1),
         }
 
 

@@ -32,9 +32,75 @@ interface LivenessResponse {
   selfie_ready?: boolean;
   calibrated?: boolean;
   challenge?: string | null;
+  face_bbox?: number[] | null;
+  face_landmarks?: {x: number; y: number}[] | null;
+  face_yaw?: number;
+  face_pitch?: number;
 }
 
 type LivenessState = "connecting" | "calibrating" | "running" | "passed" | "failed";
+
+
+function FaceTrackingOverlay({
+  landmarks,
+  bbox,
+  canvasRef,
+  videoRef,
+  visible,
+}: {
+  landmarks: { x: number; y: number }[] | null;
+  bbox: number[] | null;
+  canvasRef: React.RefObject<HTMLCanvasElement | null>;
+  videoRef: React.RefObject<HTMLVideoElement | null>;
+  visible: boolean;
+}) {
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const video = videoRef.current;
+    if (!canvas || !video || !visible) return;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    canvas.width = video.videoWidth || 640;
+    canvas.height = video.videoHeight || 480;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Draw face bounding box
+    if (bbox && bbox.length === 4) {
+      const [x, y, w, h] = bbox;
+      const sx = canvas.width / video.videoWidth;
+      const sy = canvas.height / video.videoHeight;
+      const rx = (video.videoWidth - (x + w)) * sx;  // mirror for selfie view
+      const ry = y * sy;
+      const rw = w * sx;
+      const rh = h * sy;
+
+      ctx.strokeStyle = "rgba(74, 222, 128, 0.6)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.roundRect(rx, ry, rw, rh, 12);
+      ctx.stroke();
+    }
+
+    // Draw landmarks
+    if (landmarks) {
+      const sx = canvas.width / video.videoWidth;
+      const sy = canvas.height / video.videoHeight;
+      ctx.fillStyle = "rgba(147, 197, 253, 0.8)";
+      for (const lm of landmarks) {
+        const lx = (video.videoWidth - lm.x) * sx;  // mirror
+        const ly = lm.y * sy;
+        ctx.beginPath();
+        ctx.arc(lx, ly, 2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  }, [landmarks, bbox, visible, canvasRef, videoRef]);
+
+  if (!visible) return null;
+  return null;
+}
 
 export default function LivenessStep({
   token,
@@ -56,6 +122,9 @@ export default function LivenessStep({
   const [faceDetected, setFaceDetected] = useState(false);
   const [finalizing, setFinalizing] = useState(false);
   const [camError, setCamError] = useState<string | null>(null);
+  const [faceLandmarks, setFaceLandmarks] = useState<{x: number; y: number}[] | null>(null);
+  const [faceBBox, setFaceBBox] = useState<number[] | null>(null);
+  const overlayRef = useRef<HTMLCanvasElement | null>(null);
 
   // ── Single unified effect: camera → websocket → frames → cleanup ─
   useEffect(() => {
@@ -124,6 +193,8 @@ export default function LivenessStep({
             const data: LivenessResponse = JSON.parse(event.data);
             setFaceDetected(data.face_detected ?? true);
             setInstruction(data.instruction);
+            if (data.face_landmarks) setFaceLandmarks(data.face_landmarks);
+            if (data.face_bbox) setFaceBBox(data.face_bbox);
 
             if (data.calibrated === false) {
               setLivenessState("calibrating");
@@ -263,6 +334,19 @@ export default function LivenessStep({
           muted
           className="h-full w-full object-cover"
           style={{ aspectRatio: "3/4", transform: "scaleX(-1)" }}
+        />
+        {/* Face tracking canvas overlay */}
+        <canvas
+          ref={overlayRef}
+          className="pointer-events-none absolute inset-0 h-full w-full"
+          style={{ transform: "scaleX(-1)" }}
+        />
+        <FaceTrackingOverlay
+          landmarks={faceLandmarks}
+          bbox={faceBBox}
+          canvasRef={overlayRef}
+          videoRef={videoRef}
+          visible={livenessState === "running" || livenessState === "calibrating"}
         />
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
           <div
