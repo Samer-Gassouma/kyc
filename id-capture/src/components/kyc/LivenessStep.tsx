@@ -53,7 +53,7 @@ export default function LivenessStep({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const livenessStateRef = useRef(livenessState);
+  const livenessStateRef = useRef("connecting");
   livenessStateRef.current = livenessState;
   const animRef = useRef<number | null>(null);
   const onCompleteRef = useRef(onComplete);
