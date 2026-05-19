@@ -1,0 +1,3 @@
+# Only exclude generated dependency directories
+.venv/
+node_modules/
