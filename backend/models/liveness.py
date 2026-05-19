@@ -163,6 +163,17 @@ class LivenessSession:
             if remaining <= 0:
                 self.passed = True
                 self.instruction = "تم التحقق ✔"
+                # Save selfie permanently
+                try:
+                    selfie_dir = Path(__file__).parent.parent / "selfies"
+                    selfie_dir.mkdir(exist_ok=True)
+                    spath = selfie_dir / f"{self.session_id}.jpg"
+                    if self.best_frame is not None:
+                        cv2.imwrite(str(spath), self.best_frame)
+                        self.selfie_path = str(spath)
+                        logger.info("Selfie saved: %s", spath)
+                except Exception as e:
+                    logger.warning("Selfie save failed: %s", e)
             else:
                 self.instruction = f"استمر... {self.real_frames}/{NEEDED_FRAMES}"
         else:
@@ -176,6 +187,7 @@ class LivenessSession:
             "passed": self.passed, "failed": self.failed,
             "instruction": self.instruction, "face_detected": self.face_detected,
             "selfie_ready": self.passed,
+            "selfie_url": f"/api/liveness/selfie/{self.session_id}.jpg" if self.passed else None,
             "liveness_score": round(self.liveness_score, 3),
             "progress": min(100, int(self.real_frames / NEEDED_FRAMES * 100)),
             "face_bbox": [int(v) for v in self.face_bbox] if self.face_bbox else None,

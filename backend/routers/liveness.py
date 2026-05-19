@@ -9,6 +9,7 @@ import numpy as np
 from core.auth import get_current_user_or_api_key
 from core.db import Capture, KYCResult, LivenessSession, SessionLocal
 from core.storage import download_decrypted
+from pathlib import Path
 from fastapi import (
     APIRouter,
     Depends,
@@ -133,6 +134,16 @@ async def finalize_kyc(
     finally:
         db.close()
 
+
+from fastapi.responses import FileResponse
+
+@router.get("/api/liveness/selfie/{filename}")
+async def get_selfie(filename: str):
+    """Serve a saved selfie image."""
+    path = Path(__file__).parent / "selfies" / filename
+    if not path.exists():
+        raise HTTPException(404, "Selfie not found")
+    return FileResponse(str(path), media_type="image/jpeg")
 
 @router.post("/api/liveness/reset/{session_id}")
 async def reset_liveness(session_id: str) -> dict:

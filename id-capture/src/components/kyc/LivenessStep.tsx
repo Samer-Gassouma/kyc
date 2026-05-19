@@ -32,6 +32,7 @@ interface LivenessResponse {
   selfie_ready?: boolean;
   liveness_score?: number;
   progress?: number;
+  selfie_url?: string | null;
   face_bbox?: number[] | null;
   face_landmarks?: {x: number; y: number}[] | null;
 }
@@ -120,6 +121,7 @@ export default function LivenessStep({
   const [faceDetected, setFaceDetected] = useState(false);
   const [finalizing, setFinalizing] = useState(false);
   const [camError, setCamError] = useState<string | null>(null);
+  const [selfieUrl, setSelfieUrl] = useState<string | null>(null);
   const [faceLandmarks, setFaceLandmarks] = useState<{x: number; y: number}[] | null>(null);
   const [progress, setProgress] = useState(0);
   const [progressNeeded, setProgressNeeded] = useState(2);
@@ -195,6 +197,7 @@ export default function LivenessStep({
             setInstruction(data.instruction);
             if (data.face_landmarks) setFaceLandmarks(data.face_landmarks);
             setProgress(data.progress ?? 0);
+            if (data.selfie_url) setSelfieUrl(data.selfie_url);
             setProgressNeeded(100);
             if (data.face_bbox) setFaceBBox(data.face_bbox);
 
@@ -357,7 +360,16 @@ export default function LivenessStep({
               getBorderColor(),
             )}
           >
-            {livenessState === "passed" && (
+            {livenessState === "passed" && selfieUrl && (
+            <div className="mb-4 overflow-hidden rounded-xl border-2 border-green-400">
+              <img
+                src={`${API_BASE}${selfieUrl}`}
+                alt="Selfie"
+                className="h-48 w-full object-cover"
+              />
+            </div>
+          )}
+          {livenessState === "passed" && (
               <CheckCircle className="h-16 w-16 animate-scaleIn text-green-400" />
             )}
             {(livenessState === "failed" || livenessState === "spoof") && (
@@ -400,7 +412,16 @@ export default function LivenessStep({
           </>
         )}
 
-        {livenessState === "passed" && (
+        {livenessState === "passed" && selfieUrl && (
+            <div className="mb-4 overflow-hidden rounded-xl border-2 border-green-400">
+              <img
+                src={`${API_BASE}${selfieUrl}`}
+                alt="Selfie"
+                className="h-48 w-full object-cover"
+              />
+            </div>
+          )}
+          {livenessState === "passed" && (
           <>
             <div className="flex items-center gap-2 rounded-full bg-green-600 px-5 py-2.5 text-sm font-medium text-white">
               <CheckCircle className="h-5 w-5" />
