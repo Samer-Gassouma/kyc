@@ -13,7 +13,7 @@ interface KYCResult {
   kyc_passed: boolean;
   status?: string;
   message?: string;
-  data?: Record<string, any>;
+  data?: Record<string, unknown>;
   face_crop_url?: string | null;
   face_match?: { match: boolean; score: number; reason: string } | null;
   liveness_passed?: boolean;

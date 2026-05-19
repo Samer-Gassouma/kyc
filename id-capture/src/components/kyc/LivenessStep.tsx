@@ -56,7 +56,6 @@ export default function LivenessStep({
   const streamRef = useRef<MediaStream | null>(null);
   const animRef = useRef<number | null>(null);
   const onCompleteRef = useRef(onComplete);
-  onCompleteRef.current = onComplete;
 
   const [livenessState, setLivenessState] =
     useState<LivenessState>("connecting");
@@ -65,20 +64,47 @@ export default function LivenessStep({
   const [finalizing, setFinalizing] = useState(false);
   const [camError, setCamError] = useState<string | null>(null);
   const [selfieUrl, setSelfieUrl] = useState<string | null>(null);
-  const [faceLandmarks, setFaceLandmarks] = useState<
+  const [faceLandmarks] = useState<
     { x: number; y: number }[] | null
   >(null);
   const [progress, setProgress] = useState(0);
   const [progressNeeded, setProgressNeeded] = useState(2);
-  const [faceBBox, setFaceBBox] = useState<number[] | null>(null);
+  const [faceBBox] = useState<number[] | null>(null);
   const livenessStateRef = useRef(livenessState);
-  livenessStateRef.current = livenessState;
+
+  const startFrameLoop = (
+    video: HTMLVideoElement,
+    canvas: HTMLCanvasElement,
+    ws: WebSocket,
+  ) => {
+    let lastSend = 0;
+    const INTERVAL = 100;
+
+    const loop = () => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      const now = Date.now();
+      if (now - lastSend >= INTERVAL) {
+        lastSend = now;
+        grabFrame(video, canvas);
+        canvasToJpegBlob(canvas, 0.7).then((blob) => {
+          blob.arrayBuffer().then((buf) => {
+            if (ws.readyState === WebSocket.OPEN) ws.send(buf);
+          });
+        });
+      }
+      animRef.current = requestAnimationFrame(loop);
+    };
+
+    animRef.current = requestAnimationFrame(loop);
+  };
 
   // ── Single unified effect: camera → websocket → frames → cleanup ─
   useEffect(() => {
     if (!sessionId) return;
 
     let stopped = false;
+    onCompleteRef.current = onComplete;
+    livenessStateRef.current = livenessState;
     const canvas = document.createElement("canvas");
     canvasRef.current = canvas;
 
@@ -207,31 +233,6 @@ export default function LivenessStep({
   }, [sessionId]);
 
   // ── Frame loop ──────────────────────────────────────────────
-  const startFrameLoop = (
-    video: HTMLVideoElement,
-    canvas: HTMLCanvasElement,
-    ws: WebSocket,
-  ) => {
-    let lastSend = 0;
-    const INTERVAL = 100;
-
-    const loop = () => {
-      if (ws.readyState !== WebSocket.OPEN) return;
-      const now = Date.now();
-      if (now - lastSend >= INTERVAL) {
-        lastSend = now;
-        grabFrame(video, canvas);
-        canvasToJpegBlob(canvas, 0.7).then((blob) => {
-          blob.arrayBuffer().then((buf) => {
-            if (ws.readyState === WebSocket.OPEN) ws.send(buf);
-          });
-        });
-      }
-      animRef.current = requestAnimationFrame(loop);
-    };
-
-    animRef.current = requestAnimationFrame(loop);
-  };
 
   // ── Retry handler ───────────────────────────────────────────
   const handleRetry = useCallback(async () => {
