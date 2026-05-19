@@ -109,8 +109,14 @@ class LivenessSession:
         self.instruction = "انظر إلى الكاميرا"
         self.face_detected = False
         self.face_bbox: tuple | None = None
+        self.last_bbox: tuple | None = None  # for stability check
         self.landmarks_2d: list | None = None
         self.liveness_score = 0.0
+        # Phase 1: face presence confirmation
+        self.face_presence_count = 0
+        self.face_confirmed = False
+        self.face_confirm_needed = 8  # frames with stable face before starting
+        # Phase 2: liveness verification
         self.real_frames = 0
         self.best_frame: np.ndarray | None = None
         self.best_quality = 0.0
@@ -125,19 +131,16 @@ class LivenessSession:
             self.instruction = "انتهت المهلة — حاول مجدداً"
             return self._response()
 
-        # Enhance for low light
         enhanced = _enhance(frame)
+        det = _detect_face(enhanced) or _detect_face(frame)
 
-        # Try detection on enhanced frame, fall back to original
-        det = _detect_face(enhanced)
-        if det is None:
-            det = _detect_face(frame)
-
+        # ── No face ─────────────────────────────────────────
         if det is None:
             self.face_detected = False
             self.no_face_count += 1
+            self.face_presence_count = max(0, self.face_presence_count - 1)
             self.real_frames = max(0, self.real_frames - 1)
-            if self.no_face_count > 30:
+            if self.no_face_count > 40:
                 self.instruction = "تأكد من وجود إضاءة كافية"
             else:
                 self.instruction = "ضع وجهك في الإطار"
@@ -145,15 +148,43 @@ class LivenessSession:
 
         self.no_face_count = 0
         x1, y1, x2, y2, score = det
-        self.face_detected = True
-        self.face_bbox = (int(x1), int(y1), int(x2 - x1), int(y2 - y1))
+        fw, fh = x2 - x1, y2 - y1
+        cx, cy = x1 + fw // 2, y1 + fh // 2
 
-        # Landmarks for frontend overlay
+        # ── Phase 1: Face presence confirmation ─────────────
+        if not self.face_confirmed:
+            # Check bbox stability — center shouldn't jump >20% of face size
+            if self.last_bbox is not None:
+                lx, ly, lfw, lfh = self.last_bbox
+                lcx, lcy = lx + lfw // 2, ly + lfh // 2
+                jump = abs(cx - lcx) / max(fw, 1) + abs(cy - lcy) / max(fh, 1)
+                if jump < 0.3:  # stable
+                    self.face_presence_count += 1
+                else:
+                    self.face_presence_count = max(0, self.face_presence_count - 1)
+            else:
+                self.face_presence_count += 1
+
+            self.last_bbox = (x1, y1, fw, fh)
+            self.face_detected = True
+            self.face_bbox = (int(x1), int(y1), int(fw), int(fh))
+
+            if self.face_presence_count >= self.face_confirm_needed:
+                self.face_confirmed = True
+                self.instruction = "جاري التحقق..."
+            else:
+                pct = int(self.face_presence_count / self.face_confirm_needed * 100)
+                self.instruction = f"ثابت... جاري التعرف ({pct}%)"
+            return self._response()
+
+        # ── Phase 2: Liveness verification ──────────────────
+        self.face_detected = True
+        self.face_bbox = (int(x1), int(y1), int(fw), int(fh))
+
         lm = _get_landmarks(enhanced, (x1, y1, x2, y2))
         if lm and len(lm) >= 20:
             self.landmarks_2d = [{"x": round(p[0], 1), "y": round(p[1], 1)} for p in lm[:25]]
 
-        # Liveness check
         liveness = _check_liveness(enhanced, (x1, y1, x2, y2))
         self.liveness_score = liveness
 
@@ -163,7 +194,6 @@ class LivenessSession:
             if remaining <= 0:
                 self.passed = True
                 self.instruction = "تم التحقق ✔"
-                # Save selfie permanently
                 try:
                     selfie_dir = Path(__file__).parent.parent / "selfies"
                     selfie_dir.mkdir(exist_ok=True)
@@ -171,11 +201,10 @@ class LivenessSession:
                     if self.best_frame is not None:
                         cv2.imwrite(str(spath), self.best_frame)
                         self.selfie_path = str(spath)
-                        logger.info("Selfie saved: %s", spath)
                 except Exception as e:
                     logger.warning("Selfie save failed: %s", e)
             else:
-                self.instruction = f"استمر... {self.real_frames}/{NEEDED_FRAMES}"
+                self.instruction = f"تم التحقق... {self.real_frames}/{NEEDED_FRAMES}"
         else:
             self.real_frames = max(0, self.real_frames - 1)
             self.instruction = "انظر مباشرة إلى الكاميرا"
