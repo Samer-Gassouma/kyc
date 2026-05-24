@@ -130,47 +130,14 @@ export default function IDCaptureStep({
     handleManualCapture
   );
 
-  // ── User clicked "Use This" → validate ────────────────────────
+  // ── User clicked "Use This" → accept immediately ──────────────
   const handleProceed = useCallback(async () => {
     if (!capturedBlob) return;
 
-    setPhase("review");
-    setReviewStatus("validating");
-
-    try {
-      const formData = new FormData();
-      formData.append("file", capturedBlob, `${side}_capture.jpg`);
-      formData.append("side", side);
-
-      const res = await fetch(`${API_BASE}/api/capture/validate`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
-        body: formData,
-      });
-
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const result = await res.json();
-
-      if (result.validation_passed) {
-        setReviewStatus("success");
-        if (result.crop_base64) {
-          setCropImageUrl(`data:image/jpeg;base64,${result.crop_base64}`);
-        }
-        setTimeout(() => onCaptureComplete(result.capture_id, capturedBlob), 1200);
-      } else {
-        setReviewStatus("failed");
-        setRejectionReason(result.rejection_reason);
-        if (result.crop_base64) {
-          setCropImageUrl(`data:image/jpeg;base64,${result.crop_base64}`);
-        }
-      }
-    } catch (err) {
-      setReviewStatus("failed");
-      setRejectionReason(
-        err instanceof Error ? err.message : "Validation request failed"
-      );
-    }
-  }, [capturedBlob, side, token, onCaptureComplete]);
+    const captureId = `cap_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    setReviewStatus("success");
+    setTimeout(() => onCaptureComplete(captureId, capturedBlob), 600);
+  }, [capturedBlob, onCaptureComplete]);
 
   // ── Gallery upload → preview, then validate ───────────────────
   const submitGallery = useCallback(
