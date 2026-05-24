@@ -15,7 +15,7 @@ import CaptureReview from "./CaptureReview";
 interface IDCaptureStepProps {
   side: "front" | "back";
   token: string;
-  onCaptureComplete: (captureId: string) => void;
+  onCaptureComplete: (captureId: string, blob: Blob) => void;
 }
 
 type Phase = "camera" | "review";
@@ -45,6 +45,7 @@ export default function IDCaptureStep({
     "validating" | "success" | "failed"
   >("validating");
   const [rejectionReason, setRejectionReason] = useState<string | null>(null);
+  const [videoSize, setVideoSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
 
   const loopRef = useRef<number | null>(null);
   const fullResCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -127,7 +128,7 @@ export default function IDCaptureStep({
           if (result.crop_base64) {
             setCropImageUrl(`data:image/jpeg;base64,${result.crop_base64}`);
           }
-          setTimeout(() => onCaptureComplete(result.capture_id), 1200);
+          setTimeout(() => onCaptureComplete(result.capture_id, blob), 1200);
         } else {
           setReviewStatus("failed");
           setRejectionReason(result.rejection_reason);
@@ -206,7 +207,7 @@ export default function IDCaptureStep({
 
         if (result.validation_passed) {
           setReviewStatus("success");
-          setTimeout(() => onCaptureComplete(result.capture_id), 1200);
+          setTimeout(() => onCaptureComplete(result.capture_id, file), 1200);
         } else {
           setReviewStatus("failed");
           setRejectionReason(

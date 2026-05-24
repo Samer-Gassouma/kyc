@@ -1,3 +1,16 @@
-# Only exclude generated dependency directories
+# Dependencies
 .venv/
-weights/ocr_cleaner_finetuned/model.safetensors
+
+# Secrets
+.env
+
+# Runtime data
+selfies/
+logs/
+__pycache__/
+
+# Model weights (downloaded via scripts/setup_models.py)
+weights/*.pt
+weights/*.pth
+weights/*.onnx
+weights/*.task

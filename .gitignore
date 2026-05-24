@@ -1,3 +1,17 @@
-# Only exclude generated dependency directories
+# Dependencies
 .venv/
 node_modules/
+
+# Secrets & environment
+.env
+.env.local
+
+# SQLite databases
+*.db
+
+# Python
+__pycache__/
+
+# Runtime data
+backend/selfies/
+backend/logs/

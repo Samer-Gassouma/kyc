@@ -34,11 +34,11 @@ app.add_middleware(
 
 # ── Routers ────────────────────────────────────────────────────────
 app.include_router(auth.router)
+app.include_router(liveness.router)
 app.include_router(stream.router)
 app.include_router(capture.router)
 app.include_router(extract.router)
 app.include_router(gallery.router)
-app.include_router(liveness.router)
 
 
 @app.on_event("startup")

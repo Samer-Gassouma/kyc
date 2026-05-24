@@ -35,17 +35,3 @@ def ocr_task(
     return process_ocr(image_bytes, capture_id, side, corrected_card_bytes=corrected_card)
 
 
-@app.task(name="tasks.face_match")
-def face_match_task(
-    id_face_hex: str,
-    live_face_hex: str,
-    session_id: str,
-) -> dict:
-    """Compare ID face to live face."""
-    from tasks.face_match_task import process_face_match
-
-    return process_face_match(
-        bytes.fromhex(id_face_hex),
-        bytes.fromhex(live_face_hex),
-        session_id,
-    )

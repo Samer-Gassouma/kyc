@@ -86,20 +86,6 @@ def test_ocr(images: dict):
             print(f"    MRZ: {mrz}")
 
 
-def test_liveness_on_frame(images: dict):
-    print("\n── Liveness (single frame) ──")
-    from models.liveness import process_liveness_frame
-
-    for name, img in images.items():
-        t0 = time.time()
-        result = process_liveness_frame(img)
-        dt = (time.time() - t0) * 1000
-        face = result.get("face_detected", False)
-        yaw = result.get("yaw", 0)
-        blink = result.get("blink_detected", False)
-        print(f"  {name:30s} face={face}  yaw={yaw:.1f}  blink={blink}  {dt:.0f}ms")
-
-
 def test_quality_checker(images: dict):
     print("\n── Quality Checker ──")
     from models.quality_checker import check_quality
@@ -141,7 +127,6 @@ def main():
     test_rcnn_validation(images)
     test_quality_checker(images)
     test_ocr(images)
-    test_liveness_on_frame(images)
 
     print("\n" + "=" * 60)
     print("Pipeline test complete.")

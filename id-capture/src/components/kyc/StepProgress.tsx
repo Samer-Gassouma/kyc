@@ -3,7 +3,7 @@
 import { Check } from "lucide-react";
 import clsx from "clsx";
 
-export type KYCStep = "front_id" | "back_id" | "liveness";
+export type KYCStep = "front_id" | "back_id" | "face_scan";
 
 interface StepProgressProps {
   currentStep: KYCStep;
@@ -13,7 +13,7 @@ interface StepProgressProps {
 const STEPS: { key: KYCStep; label: string }[] = [
   { key: "front_id", label: "Front ID" },
   { key: "back_id", label: "Back ID" },
-  { key: "liveness", label: "Liveness" },
+  { key: "face_scan", label: "Face Scan" },
 ];
 
 export default function StepProgress({
@@ -28,7 +28,6 @@ export default function StepProgress({
 
         return (
           <div key={step.key} className="flex items-center gap-2">
-            {/* Step circle */}
             <div className="flex flex-col items-center gap-1">
               <div
                 className={clsx(
@@ -58,7 +57,6 @@ export default function StepProgress({
               </span>
             </div>
 
-            {/* Connector line */}
             {idx < STEPS.length - 1 && (
               <div
                 className={clsx("mb-4 h-0.5 w-10 transition-all", {
