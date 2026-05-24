@@ -18,7 +18,7 @@ interface IDCaptureStepProps {
   onCaptureComplete: (captureId: string, blob: Blob) => void;
 }
 
-type Phase = "camera" | "review";
+type Phase = "camera" | "preview" | "review";
 
 export default function IDCaptureStep({
   side,
@@ -42,8 +42,8 @@ export default function IDCaptureStep({
   const [cropImageUrl, setCropImageUrl] = useState<string>("");
   const [capturedBlob, setCapturedBlob] = useState<Blob | null>(null);
   const [reviewStatus, setReviewStatus] = useState<
-    "validating" | "success" | "failed"
-  >("validating");
+    "preview" | "validating" | "success" | "failed"
+  >("preview");
   const [rejectionReason, setRejectionReason] = useState<string | null>(null);
   const [videoSize, setVideoSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
 
@@ -76,10 +76,6 @@ export default function IDCaptureStep({
         return;
       }
 
-      // Skip local ONNX quality check — backend quality checks are authoritative
-      // await runCheck(video);
-
-      // Send to server for YOLO detection
       if (isConnected) {
         await sendFrame(video);
       }
@@ -94,60 +90,29 @@ export default function IDCaptureStep({
     };
   }, [isReady, phase, isConnected, videoRef, runCheck, sendFrame]);
 
-  // ── Capture & validate (shared by manual + auto + gallery) ──────
-  const submitCapture = useCallback(
+  // Pause camera when leaving camera phase
+  const pauseCamera = useCallback(() => {
+    stop();
+    disconnect();
+    if (loopRef.current) cancelAnimationFrame(loopRef.current);
+  }, [stop, disconnect]);
+
+  // ── Capture: grab frame, show preview ─────────────────────────
+  const doCapture = useCallback(
     async (blob: Blob) => {
       const url = URL.createObjectURL(blob);
       setCapturedBlob(blob);
       setCapturedImageUrl(url);
-      setPhase("review");
-      setReviewStatus("validating");
-
-      // Pause camera
-      stop();
-      disconnect();
-      if (loopRef.current) cancelAnimationFrame(loopRef.current);
-
-      try {
-        const formData = new FormData();
-        formData.append("file", blob, `${side}_capture.jpg`);
-        formData.append("side", side);
-
-        const res = await fetch(`${API_BASE}/api/capture/validate`, {
-          method: "POST",
-          headers: { Authorization: `Bearer ${token}` },
-          body: formData,
-        });
-
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const result = await res.json();
-
-        if (result.validation_passed) {
-          setReviewStatus("success");
-          // If backend returned a cropped card, show it
-          if (result.crop_base64) {
-            setCropImageUrl(`data:image/jpeg;base64,${result.crop_base64}`);
-          }
-          setTimeout(() => onCaptureComplete(result.capture_id, blob), 1200);
-        } else {
-          setReviewStatus("failed");
-          setRejectionReason(result.rejection_reason);
-          // Show the cropped attempt even on failure
-          if (result.crop_base64) {
-            setCropImageUrl(`data:image/jpeg;base64,${result.crop_base64}`);
-          }
-        }
-      } catch (err) {
-        setReviewStatus("failed");
-        setRejectionReason(
-          err instanceof Error ? err.message : "Validation request failed"
-        );
-      }
+      setCropImageUrl("");
+      setRejectionReason(null);
+      setReviewStatus("preview");
+      setPhase("preview");
+      pauseCamera();
     },
-    [side, token, stop, disconnect, onCaptureComplete]
+    [pauseCamera]
   );
 
-  // ── Manual capture (button press) ──────────────────────────────
+  // ── Manual capture (button press) ─────────────────────────────
   const handleManualCapture = useCallback(async () => {
     const video = videoRef.current;
     const canvas = fullResCanvasRef.current;
@@ -155,73 +120,71 @@ export default function IDCaptureStep({
 
     grabFrame(video, canvas);
     const blob = await canvasToJpegBlob(canvas, 0.95);
-    await submitCapture(blob);
-  }, [videoRef, submitCapture]);
+    await doCapture(blob);
+  }, [videoRef, doCapture]);
 
-  // ── Auto-capture (hold still 1.5s) ─────────────────────────────
+  // ── Auto-capture (hold still 1.5s) ────────────────────────────
   const readyToCapture = detection?.ready_to_capture ?? false;
   const { isHolding, holdProgress, reset: resetAutoCapture } = useAutoCapture(
     readyToCapture && phase === "camera",
     handleManualCapture
   );
 
-  // ── Gallery upload (auto-detect + crop + validate) ─────────────
+  // ── User clicked "Use This" → validate ────────────────────────
+  const handleProceed = useCallback(async () => {
+    if (!capturedBlob) return;
+
+    setPhase("review");
+    setReviewStatus("validating");
+
+    try {
+      const formData = new FormData();
+      formData.append("file", capturedBlob, `${side}_capture.jpg`);
+      formData.append("side", side);
+
+      const res = await fetch(`${API_BASE}/api/capture/validate`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: formData,
+      });
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const result = await res.json();
+
+      if (result.validation_passed) {
+        setReviewStatus("success");
+        if (result.crop_base64) {
+          setCropImageUrl(`data:image/jpeg;base64,${result.crop_base64}`);
+        }
+        setTimeout(() => onCaptureComplete(result.capture_id, capturedBlob), 1200);
+      } else {
+        setReviewStatus("failed");
+        setRejectionReason(result.rejection_reason);
+        if (result.crop_base64) {
+          setCropImageUrl(`data:image/jpeg;base64,${result.crop_base64}`);
+        }
+      }
+    } catch (err) {
+      setReviewStatus("failed");
+      setRejectionReason(
+        err instanceof Error ? err.message : "Validation request failed"
+      );
+    }
+  }, [capturedBlob, side, token, onCaptureComplete]);
+
+  // ── Gallery upload → preview, then validate ───────────────────
   const submitGallery = useCallback(
     async (file: File) => {
       const url = URL.createObjectURL(file);
       setCapturedBlob(file);
       setCapturedImageUrl(url);
-      setCropImageUrl(""); // reset
-      setPhase("review");
-      setReviewStatus("validating");
-
-      // Pause camera
-      stop();
-      disconnect();
-      if (loopRef.current) cancelAnimationFrame(loopRef.current);
-
-      try {
-        const formData = new FormData();
-        formData.append("file", file, `${side}_gallery.jpg`);
-        formData.append("side", side);
-
-        const res = await fetch(`${API_BASE}/api/gallery/process`, {
-          method: "POST",
-          headers: { Authorization: `Bearer ${token}` },
-          body: formData,
-        });
-
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const result = await res.json();
-
-        if (!result.detected) {
-          setReviewStatus("failed");
-          setRejectionReason(result.rejection_reason || "No ID card detected");
-          return;
-        }
-
-        // Show cropped card in review
-        if (result.crop_base64) {
-          setCropImageUrl(`data:image/jpeg;base64,${result.crop_base64}`);
-        }
-
-        if (result.validation_passed) {
-          setReviewStatus("success");
-          setTimeout(() => onCaptureComplete(result.capture_id, file), 1200);
-        } else {
-          setReviewStatus("failed");
-          setRejectionReason(
-            result.rejection_reason || "Card detected but validation failed"
-          );
-        }
-      } catch (err) {
-        setReviewStatus("failed");
-        setRejectionReason(
-          err instanceof Error ? err.message : "Gallery processing failed"
-        );
-      }
+      setCropImageUrl("");
+      setRejectionReason(null);
+      setReviewStatus("preview");
+      setPhase("preview");
+      pauseCamera();
     },
-    [side, token, stop, disconnect, onCaptureComplete]
+    [pauseCamera]
   );
 
   const handleGallerySelect = useCallback(
@@ -234,20 +197,20 @@ export default function IDCaptureStep({
     [submitGallery]
   );
 
-  // ── Retry ──────────────────────────────────────────────────────
+  // ── Retry: back to camera ─────────────────────────────────────
   const handleRetry = useCallback(() => {
     setPhase("camera");
     setCapturedImageUrl("");
     setCropImageUrl("");
     setCapturedBlob(null);
-    setReviewStatus("validating");
+    setReviewStatus("preview");
     setRejectionReason(null);
     resetAutoCapture();
     start();
     connect();
   }, [start, connect, resetAutoCapture]);
 
-  // ── Border state from detection result ─────────────────────────
+  // ── Border state from detection result ────────────────────────
   const getBorderState = (): BorderState => {
     if (!detection || !detection.detected) return "neutral";
     if (detection.ready_to_capture) return "success";
@@ -257,8 +220,8 @@ export default function IDCaptureStep({
 
   const sideLabel = side === "front" ? "Front of ID" : "Back of ID";
 
-  // ── Review phase ───────────────────────────────────────────────
-  if (phase === "review") {
+  // ── Preview / Review phase ────────────────────────────────────
+  if (phase === "preview" || phase === "review") {
     return (
       <CaptureReview
         imageUrl={capturedImageUrl}
@@ -266,14 +229,12 @@ export default function IDCaptureStep({
         status={reviewStatus}
         rejectionReason={rejectionReason}
         onRetry={handleRetry}
-        onContinue={() => {}}
+        onProceed={handleProceed}
       />
     );
   }
 
-  // Video natural size set via onLoadedMetadata callback on the <video> element
-
-  // ── Camera phase ───────────────────────────────────────────────
+  // ── Camera phase ──────────────────────────────────────────────
   return (
     <div className="flex w-full flex-col items-center">
       {/* Camera error */}
@@ -314,7 +275,6 @@ export default function IDCaptureStep({
           videoSize={videoSize}
         />
 
-        {/* Detection confidence badge */}
         {detection?.detected && (
           <div className="absolute right-3 top-3 z-10 flex items-center gap-1.5 rounded-full bg-black/60 px-2.5 py-1 text-[11px] font-medium text-white backdrop-blur-sm">
             <span
@@ -333,7 +293,7 @@ export default function IDCaptureStep({
         )}
       </div>
 
-      {/* Quality issue chips (below video) */}
+      {/* Quality issues */}
       <div className="mt-2.5 w-full max-w-[480px]">
         <QualityIndicator
           issues={detection?.issues ?? []}
@@ -341,14 +301,12 @@ export default function IDCaptureStep({
         />
       </div>
 
-      {/* Instruction text */}
       <p className="mt-3 text-center text-sm text-zinc-600 dark:text-zinc-400">
         Place your ID within the frame and take a picture.
       </p>
 
-      {/* ── Action buttons ────────────────────────────────────────── */}
+      {/* Action buttons */}
       <div className="mt-5 flex items-center gap-6">
-        {/* Gallery upload */}
         <button
           type="button"
           onClick={() => fileInputRef.current?.click()}
@@ -366,7 +324,6 @@ export default function IDCaptureStep({
           onChange={handleGallerySelect}
         />
 
-        {/* Capture button — big blue circle */}
         <button
           type="button"
           onClick={handleManualCapture}
@@ -376,7 +333,6 @@ export default function IDCaptureStep({
         >
           <span className="block h-[54px] w-[54px] rounded-full bg-blue-500 transition-colors group-hover:bg-blue-400 group-active:bg-blue-600" />
 
-          {/* Auto-capture ring overlay */}
           {holdProgress > 0 && holdProgress < 1 && (
             <svg
               className="absolute -inset-1 h-[76px] w-[76px]"
@@ -397,11 +353,9 @@ export default function IDCaptureStep({
           )}
         </button>
 
-        {/* Placeholder to balance the layout */}
         <div className="h-12 w-12" />
       </div>
 
-      {/* Connection status (subtle) */}
       {!isConnected && isReady && (
         <p className="mt-2 text-xs text-yellow-500">
           Connecting to detection server...
