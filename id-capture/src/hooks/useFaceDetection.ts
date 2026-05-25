@@ -46,7 +46,7 @@ async function load(): Promise<FaceLandmarker> {
           modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
           delegate: "GPU",
         },
-        runningMode: "IMAGE", numFaces: 1, outputFaceBlendshapes: false,
+        runningMode: "IMAGE", numFaces: 1, outputFaceBlendshapes: true,
       });
       console.log("[MP] FaceLandmarker ready");
       return _landmarker;
@@ -60,6 +60,7 @@ async function load(): Promise<FaceLandmarker> {
 export interface DetectResult {
   landmarks: NormalizedLandmark[][];
   faceDetected: boolean;
+  blendshapes?: any[];
 }
 
 export function useFaceDetection() {
@@ -89,7 +90,7 @@ export function useFaceDetection() {
         const face = res.faceLandmarks[0];
         const box = bboxFromLandmarks(face);
         (window as any).__face = { detected: true, box, pts: face.length };
-        return { landmarks: res.faceLandmarks, faceDetected: true };
+        return { landmarks: res.faceLandmarks, faceDetected: true, blendshapes: res.faceBlendshapes?.[0]?.categories || [] };
       }
     } catch (e) { /* ignore */ }
     (window as any).__face = { detected: false };

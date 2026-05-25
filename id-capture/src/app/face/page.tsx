@@ -27,6 +27,7 @@ export default function FacePage() {
   const streamRef = useRef<MediaStream|null>(null);
   const animRef = useRef(0);
   const stableRef = useRef(0);
+  const blinkRef = useRef({ detected: false, eyeClosed: false });
   const detectCanvasRef = useRef<HTMLCanvasElement|null>(null);
 
   const { isReady, detect } = useFaceDetection();
@@ -41,6 +42,7 @@ export default function FacePage() {
   const start = useCallback(async () => {
     setErrMsg(null); setResult(null); setPhase("active"); setScanPoints([]);
     stableRef.current=0; setCountdown(0); setStatusMsg("Position your face");
+    blinkRef.current = { detected: false, eyeClosed: false };
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video:{facingMode:"user",width:{ideal:640},height:{ideal:480}}, audio:false });
       streamRef.current=stream;
@@ -64,7 +66,7 @@ export default function FacePage() {
       const dCanvas=detectCanvasRef.current;
       if (!video||video.videoWidth===0||!dCanvas) { animRef.current=requestAnimationFrame(loop); return; }
 
-      const { landmarks, faceDetected } = detect(video, dCanvas);
+      const { landmarks, faceDetected, blendshapes } = detect(video, dCanvas);
       if (!running) return;
 
       if (faceDetected && landmarks[0]) {
@@ -78,15 +80,33 @@ export default function FacePage() {
         const goodSize = box.width / video.videoWidth > 0.25;
 
         if (goodSize) {
+          // Blink detection from blendshapes
+          if (blendshapes) {
+            const leftBlink = blendshapes.find((b:any)=>b.categoryName==="eyeBlinkLeft")?.score??0;
+            const rightBlink = blendshapes.find((b:any)=>b.categoryName==="eyeBlinkRight")?.score??0;
+            const eyeClosed = leftBlink > 0.35 || rightBlink > 0.35;
+            if (eyeClosed && !blinkRef.current.eyeClosed) blinkRef.current.eyeClosed = true;
+            if (!eyeClosed && blinkRef.current.eyeClosed) { blinkRef.current.detected = true; blinkRef.current.eyeClosed = false; }
+          }
+
           stableRef.current++;
           const remaining = Math.max(0, Math.ceil((60 - stableRef.current) / 30));
           setCountdown(remaining);
+
           if (stableRef.current >= 60) {
-            running = false;
-            handleCapture(video, pts);
-            return;
+            if (!blinkRef.current.detected) {
+              // No blink — reset
+              stableRef.current = 0; setCountdown(0);
+              blinkRef.current = { detected: false, eyeClosed: false };
+              setStatusMsg("Please blink naturally — liveness check required");
+            } else {
+              running = false;
+              handleCapture(video, pts, blinkRef.current.detected);
+              return;
+            }
+          } else {
+            setStatusMsg(remaining > 0 ? `Hold still... ${remaining}` : "Scanning...");
           }
-          setStatusMsg(remaining > 0 ? `Hold still... ${remaining}` : "Scanning...");
         } else {
           stableRef.current = Math.max(0, stableRef.current - 1);
           setCountdown(0);
@@ -110,7 +130,7 @@ export default function FacePage() {
 
   // ── Capture ────────────────────────────────────────────────────
 
-  async function handleCapture(video: HTMLVideoElement, pts: any[]) {
+  async function handleCapture(video: HTMLVideoElement, pts: any[], blinkDetected=false) {
     setPhase("capturing"); setStatusMsg("Capturing...");
     const savedPts = pts.map((p:any)=>({x:p.x,y:p.y,z:p.z}));
     setScanPoints(savedPts);
@@ -137,7 +157,7 @@ export default function FacePage() {
       if (mode==="enroll") {
         const fd = new FormData();
         fd.append("image", blob, "face.jpg");
-        fd.append("liveness_score", "1.0");
+        fd.append("liveness_score", blinkDetected ? "1.0" : "0.0");
         fd.append("landmarks_3d", JSON.stringify({
           points: pts.map(p=>({x:p.x,y:p.y,z:p.z})),
           capturedAt: Date.now(),
