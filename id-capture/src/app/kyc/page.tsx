@@ -9,11 +9,13 @@ import {
   CheckCircle,
   XCircle,
   ExternalLink,
+  Camera,
 } from "lucide-react";
 import Link from "next/link";
 import StepProgress, { KYCStep } from "@/components/kyc/StepProgress";
 import IDCaptureStep from "@/components/kyc/IDCaptureStep";
-import FaceScanStep from "@/components/kyc/FaceScanStep";
+import { useFaceDetection, REGION_EDGES } from "@/hooks/useFaceDetection";
+import { canvasToJpegBlob } from "@/lib/frameEncoder";
 
 interface SessionData {
   id_number?: string;
@@ -60,6 +62,19 @@ export default function KYCPage() {
   const backBlobRef = useRef<Blob | null>(null);
   const cinFaceBlobRef = useRef<Blob | null>(null);
 
+  // Face scan state
+  const faceVideoRef = useRef<HTMLVideoElement>(null);
+  const faceOverlayRef = useRef<HTMLCanvasElement>(null);
+  const faceStreamRef = useRef<MediaStream | null>(null);
+  const faceAnimRef = useRef(0);
+  const faceStableRef = useRef(0);
+  const faceDCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [faceMsg, setFaceMsg] = useState("");
+  const [faceCd, setFaceCd] = useState(0);
+  const [faceProgress, setFaceProgress] = useState(0);
+
+  const { isReady, detect } = useFaceDetection();
+
   // Get JWT on mount
   useEffect(() => {
     const sid = `kyc_${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -73,7 +88,118 @@ export default function KYCPage() {
       .catch(() => setToken("dev_token"));
   }, []);
 
-  // ── Step 1: Front captured ────────────────────────────────────────
+  // ── Face scan: start camera when phase becomes face_scan ──────────
+  useEffect(() => {
+    if (phase !== "face_scan") return;
+    let running = true;
+    setFaceMsg("Loading..."); setFaceCd(0); setFaceProgress(0);
+    faceStableRef.current = 0;
+
+    (async () => {
+      try {
+        const s = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } }, audio: false,
+        });
+        if (!running) { s.getTracks().forEach(t => t.stop()); return; }
+        faceStreamRef.current = s;
+        const v = faceVideoRef.current; if (!v) return;
+        v.srcObject = s; await v.play();
+      } catch (e) { setError(e instanceof Error ? e.message : "Camera"); setPhase("failed"); }
+    })();
+
+    return () => { running = false; faceStreamRef.current?.getTracks().forEach(t => t.stop()); };
+  }, [phase]);
+
+  // ── Face scan frame loop ──────────────────────────────────────────
+  useEffect(() => {
+    if (phase !== "face_scan") return;
+    let running = true;
+    if (!faceDCanvasRef.current) faceDCanvasRef.current = document.createElement("canvas");
+
+    const loop = () => {
+      if (!running) return;
+      const v = faceVideoRef.current, dc = faceDCanvasRef.current;
+      if (!v || v.videoWidth === 0 || !dc) { faceAnimRef.current = requestAnimationFrame(loop); return; }
+
+      const { landmarks, faceDetected } = detect(v, dc);
+      if (!running) return;
+
+      if (faceDetected && landmarks[0]) {
+        const pts = landmarks[0];
+        drawFaceMesh(faceOverlayRef.current!, pts, v.videoWidth, v.videoHeight);
+        const b = faceBbox(pts, v.videoWidth, v.videoHeight);
+        const goodSize = b.width / v.videoWidth > 0.25;
+
+        if (goodSize) {
+          faceStableRef.current++;
+          const r = Math.max(0, Math.ceil((50 - faceStableRef.current) / 30));
+          setFaceCd(r); setFaceProgress(Math.round((faceStableRef.current / 50) * 100));
+          if (faceStableRef.current >= 50) { running = false; faceDoCapture(v); return; }
+          setFaceMsg(r > 0 ? `Hold still... ${r}` : "Scanning...");
+        } else {
+          faceStableRef.current = Math.max(0, faceStableRef.current - 1);
+          setFaceCd(0); setFaceProgress(0); setFaceMsg("Move closer — face too small");
+        }
+      } else {
+        faceStableRef.current = Math.max(0, faceStableRef.current - 3);
+        setFaceCd(0); setFaceProgress(0); setFaceMsg("No face detected");
+        const ov = faceOverlayRef.current;
+        if (ov) { const c = ov.getContext("2d"); if (c) c.clearRect(0, 0, ov.width, ov.height); }
+      }
+      faceAnimRef.current = requestAnimationFrame(loop);
+    };
+    faceAnimRef.current = requestAnimationFrame(loop);
+    return () => { running = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, isReady]);
+
+  async function faceDoCapture(video: HTMLVideoElement) {
+    setPhase("extracting"); // temp phase to hide camera
+    const c = document.createElement("canvas");
+    c.width = video.videoWidth; c.height = video.videoHeight;
+    c.getContext("2d")!.drawImage(video, 0, 0);
+    const blob = await canvasToJpegBlob(c, 0.85);
+
+    try {
+      const fd = new FormData(); fd.append("image", blob, "face.jpg"); fd.append("liveness_score", "1.0");
+      const res = await fetch(`${API_BASE}/api/face/enroll`, { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: fd });
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `HTTP ${res.status}`);
+      const d = await res.json();
+      setUserId(d.user_id);
+      setVerificationResult({ passed: true, confidence: 1.0, user_id: d.user_id });
+
+      // Start extraction in background
+      const frontBlob = frontBlobRef.current;
+      const backBlob = backBlobRef.current;
+      if (frontBlob && backBlob) {
+        try {
+          const efd = new FormData(); efd.append("front", frontBlob, "front.jpg"); efd.append("back", backBlob, "back.jpg");
+          const eres = await fetch(`${API_BASE}/api/extract/start`, { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: efd });
+          if (eres.ok) setExtractSid((await eres.json()).session_id);
+        } catch { /* non-fatal */ }
+      }
+      setPhase("completed");
+    } catch (e) { setError(e instanceof Error ? e.message : "Enrollment failed"); setPhase("failed"); }
+  }
+
+  function faceBbox(pts: any[], vw: number, vh: number) {
+    let x = Infinity, y = Infinity, X = -Infinity, Y = -Infinity;
+    for (const p of pts) { if (p.x < x) x = p.x; if (p.x > X) X = p.x; if (p.y < y) y = p.y; if (p.y > Y) Y = p.y; }
+    return { x: x * vw, y: y * vh, width: (X - x) * vw, height: (Y - y) * vh };
+  }
+
+  function drawFaceMesh(canvas: HTMLCanvasElement, pts: any[], vw: number, vh: number) {
+    canvas.width = vw; canvas.height = vh;
+    const ctx = canvas.getContext("2d"); if (!ctx || pts.length < 400) return;
+    ctx.clearRect(0, 0, vw, vh);
+    for (const [, r] of Object.entries(REGION_EDGES)) {
+      ctx.strokeStyle = r.color + "99"; ctx.lineWidth = 1.4; ctx.beginPath();
+      for (const [a, b] of r.edges) { if (a >= pts.length || b >= pts.length) continue; ctx.moveTo(pts[a].x * vw, pts[a].y * vh); ctx.lineTo(pts[b].x * vw, pts[b].y * vh); }
+      ctx.stroke();
+    }
+    ctx.fillStyle = "rgba(255,255,255,0.5)";
+    for (let i = 0; i < pts.length; i += 3) { ctx.beginPath(); ctx.arc(pts[i].x * vw, pts[i].y * vh, 1.1, 0, Math.PI * 2); ctx.fill(); }
+  }
   const handleFrontComplete = useCallback(
     (_captureId: string, blob: Blob) => {
       frontBlobRef.current = blob;
@@ -191,13 +317,29 @@ export default function KYCPage() {
           />
         )}
 
-        {/* Step 3: Face scan */}
+        {/* Step 3: Face scan — inline, same logic as /face */}
         {phase === "face_scan" && (
-          <FaceScanStep
-            token={token}
-            userId={userId}
-            onComplete={handleFaceScanComplete}
-          />
+          <div className="flex flex-col items-center gap-4 w-full">
+            <div className="relative w-full overflow-hidden rounded-2xl bg-black" style={{ maxWidth: 400 }}>
+              <div className="relative">
+                <video ref={faceVideoRef} autoPlay playsInline muted className="h-full w-full object-cover" style={{ aspectRatio: "3/4", transform: "scaleX(-1)" }} />
+                <canvas ref={faceOverlayRef} className="pointer-events-none absolute inset-0 h-full w-full" style={{ transform: "scaleX(-1)" }} />
+                {faceCd > 0 && faceCd <= 3 && (
+                  <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/30">
+                    <span className="text-7xl font-bold text-white animate-pulse">{faceCd}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+            <div className="flex flex-col items-center gap-2 text-center">
+              <p className="text-sm text-zinc-400"><Camera className="mr-1 inline h-4 w-4" />{faceMsg}</p>
+              {faceProgress > 0 && (
+                <div className="h-1 w-40 rounded-full bg-zinc-700">
+                  <div className="h-full rounded-full bg-sky-400 transition-all" style={{ width: `${faceProgress}%` }} />
+                </div>
+              )}
+            </div>
+          </div>
         )}
 
         {/* Results */}
