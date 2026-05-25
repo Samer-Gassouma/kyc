@@ -120,19 +120,48 @@ export default function FacePage() {
   }
 
   function detectAngle(): Angle | null {
-    // Use MediaPipe's transformation matrix → Euler angles (already mirrored for front camera)
-    // After mirror correction in useMediaPipeFace:
-    //   yaw < 0  = turning head LEFT
-    //   yaw > 0  = turning head RIGHT
-    //   pitch < 0 = looking UP
-    if (!headPose) return null;
+    // Landmark-based head pose — reliable, no matrix decomposition ambiguity.
+    // MediaPipe processes the RAW (un-mirrored) camera frame:
+    //   RAW image right side  = person's LEFT side
+    //   RAW image left side   = person's RIGHT side
+    //
+    // When turning head LEFT physically:  nose goes RIGHT in the raw image
+    // When turning head RIGHT physically: nose goes LEFT in the raw image
+    if (!landmarks || !landmarks[0] || landmarks[0].length < 468) return null;
+    const pts = landmarks[0];
 
-    const { yaw, pitch } = headPose;
+    const nose = pts[1];       // nose tip
+    const chin = pts[152];     // chin
+    const leftEar = pts[234];  // left ear / cheek
+    const rightEar = pts[454]; // right ear / cheek
+    const glabella = pts[168]; // between eyebrows
+    const leftEyeOuter = pts[33];
+    const rightEyeOuter = pts[263];
 
-    if (yaw < -18) return "left";
-    if (yaw > 18) return "right";
-    if (pitch < -10) return "up";
-    if (Math.abs(yaw) < 8 && Math.abs(pitch) < 6) return "center";
+    const faceCenterX = (leftEar.x + rightEar.x) / 2;
+    const faceW = Math.max(Math.abs(rightEar.x - leftEar.x), 0.01);
+    const noseOffX = (nose.x - faceCenterX) / faceW;
+
+    // Pitch: compare nose-to-eyebrow distance vs chin-to-eyebrow distance.
+    // When looking UP, nose comes up (closer to glabella in image).
+    // y=0 is top of image. Smaller y = higher.
+    const eyeY = (glabella.y + leftEyeOuter.y + rightEyeOuter.y) / 3;
+    const faceH = Math.max(Math.abs(chin.y - eyeY), 0.01);
+    const noseRelEyeY = (nose.y - eyeY) / faceH;
+
+    // Log for calibration (once per 2 seconds)
+    if (Math.random() < 0.015) {
+      console.log(`[Pose] noseOffX=${noseOffX.toFixed(3)} (neg=right, pos=left)  noseRelEyeY=${noseRelEyeY.toFixed(3)} (small=up)`);
+    }
+
+    // noseOffX > 0  = nose on right side of raw image = turned LEFT
+    if (noseOffX > 0.10) return "left";
+    // noseOffX < 0  = nose on left side of raw image = turned RIGHT
+    if (noseOffX < -0.10) return "right";
+    // noseRelEyeY < 0.20 = nose close to eye level = looking UP
+    if (noseRelEyeY < 0.20) return "up";
+    // centered: small offset in both axes
+    if (Math.abs(noseOffX) < 0.05 && noseRelEyeY > 0.28) return "center";
 
     return null;
   }
