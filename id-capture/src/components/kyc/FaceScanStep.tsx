@@ -36,7 +36,7 @@ export default function FaceScanStep({ token, userId, onComplete }: FaceScanStep
   }, []);
 
   useEffect(()=>{startCam();return cleanup;},[]); // eslint-disable-line
-  useEffect(()=>{ if(isReady&&videoRef.current&&videoRef.current.videoWidth>0&&state==="preparing") {setState("scanning");setMsg("Position your face");} },[isReady,state]);
+  useEffect(()=>{ if(isReady&&videoRef.current&&videoRef.current.readyState>=2&&state==="preparing") {setState("scanning");setMsg("Position your face");} },[isReady,state]);
 
   useEffect(() => {
     if (state!=="scanning") return;
