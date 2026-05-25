@@ -18,48 +18,33 @@ async function ensureModels(): Promise<void> {
   if (_loaded) return;
   if (!_loading) {
     _loading = (async () => {
-      const faceapi = await getFaceApi();
-      console.log("[face-api] Loading models...");
-      await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
-      await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
-      await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
+      const fa = await getFaceApi();
+      console.log("[face-api] Loading tiny face detector only...");
+      await fa.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
       _loaded = true;
-      console.log("[face-api] Models ready");
+      console.log("[face-api] Ready (bbox-only)");
     })();
   }
   return _loading;
 }
 
-function computePose(landmarks: any, boxW: number, boxH: number) {
-  const nose = landmarks.getNose();
-  const leftEye = landmarks.getLeftEye();
-  const rightEye = landmarks.getRightEye();
-  const jaw = landmarks.getJawOutline();
-
-  const noseTip = nose[3];
-  const eyeCenterX = (leftEye[0].x + rightEye[3].x) / 2;
-  const eyeCenterY = (leftEye[0].y + rightEye[3].y) / 2;
-  const chinTip = jaw[8];
-  const leftCheek = jaw[0];
-  const rightCheek = jaw[16];
-
-  const faceW = Math.max(rightCheek.x - leftCheek.x, 1);
-  const noseOffX = (noseTip.x - eyeCenterX) / faceW;
-
-  const faceH = Math.max(chinTip.y - eyeCenterY, 1);
-  const noseOffY = (noseTip.y - eyeCenterY) / faceH;
-
-  return {
-    yaw: -noseOffX * 100,
-    pitch: noseOffY * 100,
-    roll: 0,
-  };
+export interface FaceBox {
+  x: number; y: number; width: number; height: number;
 }
 
-export interface FaceResult {
-  box: { x: number; y: number; width: number; height: number };
-  landmarks: any;
-  pose: { yaw: number; pitch: number; roll: number };
+export type PoseState = "center" | "left" | "right" | "up" | "none";
+
+function detectPose(box: FaceBox, frameW: number, frameH: number): PoseState {
+  const cx = box.x + box.width / 2;
+  const cy = box.y + box.height / 2;
+  const nx = (cx - frameW / 2) / (frameW / 2);
+  const ny = (cy - frameH / 2) / (frameH / 2);
+
+  if (nx > 0.22) return "left";
+  if (nx < -0.22) return "right";
+  if (ny < -0.18) return "up";
+  if (Math.abs(nx) < 0.12 && Math.abs(ny) < 0.12) return "center";
+  return "none";
 }
 
 export function useFaceDetection() {
@@ -69,31 +54,33 @@ export function useFaceDetection() {
   useEffect(() => {
     if (started.current) return;
     started.current = true;
-    ensureModels().then(() => setIsReady(true)).catch((e) => {
-      console.error("[face-api] Load failed:", e);
-    });
+    ensureModels().then(() => setIsReady(true)).catch(e => console.error("[face-api] fail:", e));
   }, []);
 
-  async function detect(video: HTMLVideoElement): Promise<FaceResult | null> {
-    if (!_loaded) return null;
-    const faceapi = _faceapi;
-    if (!faceapi) return null;
-
+  async function detect(video: HTMLVideoElement): Promise<{ box: FaceBox; pose: PoseState } | null> {
+    const fa = _faceapi;
+    if (!fa || !_loaded) return null;
     const vw = video.videoWidth, vh = video.videoHeight;
     if (!vw || !vh) return null;
 
-    const result = await faceapi.detectSingleFace(
-      video,
-      new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 })
-    ).withFaceLandmarks();
+    try {
+      const result = await fa.detectSingleFace(
+        video,
+        new fa.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 })
+      );
+      // NO .withFaceLandmarks() — bounding box only, much faster
 
-    if (!result) return null;
+      if (!result) return null;
 
-    const box = result.detection.box;
-    const pose = computePose(result.landmarks, box.width, box.height);
-    (window as any).__headPose = pose;
+      const raw = result.box; // { x, y, width, height }
+      const box: FaceBox = { x: raw.x, y: raw.y, width: raw.width, height: raw.height };
+      const pose = detectPose(box, vw, vh);
+      (window as any).__pose = { pose, box };
 
-    return { box, landmarks: result.landmarks, pose };
+      return { box, pose };
+    } catch {
+      return null;
+    }
   }
 
   return { isReady, detect };
