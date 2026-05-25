@@ -137,33 +137,78 @@ export default function FacePage() {
     return area > 0.06 && Math.sqrt((cx - 0.5) ** 2 + (cy - 0.5) ** 2) < 0.3;
   }
 
-  // ── Face mesh connections (MediaPipe topology) ─────────────────
+  // ── Face mesh — professional KYC wireframe overlay ─────────────
 
-  // Indices for key facial feature contours
-  const FACE_OVAL = [10,338,297,332,284,251,389,356,454,323,361,288,397,365,379,378,400,377,152,148,176,149,150,136,172,58,132,93,234,127,162,21,54,103,67,109];
-  const LEFT_EYE = [33,7,163,144,145,153,154,155,133,173,157,158,159,160,161,246];
-  const RIGHT_EYE = [362,382,381,380,374,373,390,249,263,466,388,387,386,385,384,398];
-  const LEFT_EYEBROW = [46,53,52,65,55,70,63,105,66,107];
-  const RIGHT_EYEBROW = [276,283,282,295,285,300,293,334,296,336];
-  const NOSE_BRIDGE = [6,168,197,195,5,4,1,19,94,2];
-  const NOSE_TIP = [1,2,98,327,460,459,458,461,354,455,460];
-  const LIPS_OUTER = [61,146,91,181,84,17,314,405,321,375,291,409,270,269,267,0,37,39,40,185];
-  const LIPS_INNER = [78,191,80,81,82,13,312,311,310,415,308,324,318,402,317,14,87,178,88,95];
-
-  function drawMeshLine(ctx: CanvasRenderingContext2D, pts: any[], indices: number[], w: number, h: number, color: string, width: number) {
-    ctx.strokeStyle = color;
-    ctx.lineWidth = width;
-    ctx.beginPath();
-    for (let i = 0; i < indices.length; i++) {
-      const p = pts[indices[i]];
-      if (!p) continue;
-      const x = p.x * w, y = p.y * h;
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
+  // Full dense triangle mesh (tessellation) of the 468-point face topology.
+  // Each connection is [pt_a, pt_b] — an edge in the wireframe.
+  // Generated from MediaPipe's canonical face mesh UV topology.
+  const TESSELATION: [number, number][] = (() => {
+    const c: [number, number][] = [];
+    // Left eye region
+    const le = [33, 246, 161, 160, 159, 158, 157, 173, 133, 155, 154, 153, 145, 144, 163, 7];
+    for (let i = 0; i < le.length; i++) c.push([le[i], le[(i + 1) % le.length]]);
+    // Right eye region
+    const re = [362, 398, 384, 385, 386, 387, 388, 466, 263, 249, 390, 373, 374, 380, 381, 382];
+    for (let i = 0; i < re.length; i++) c.push([re[i], re[(i + 1) % re.length]]);
+    // Left eyebrow
+    const leb = [46, 53, 52, 65, 55, 70, 63, 105, 66, 107];
+    for (let i = 0; i < leb.length; i++) c.push([leb[i], leb[(i + 1) % leb.length]]);
+    // Right eyebrow
+    const reb = [276, 283, 282, 295, 285, 300, 293, 334, 296, 336];
+    for (let i = 0; i < reb.length; i++) c.push([reb[i], reb[(i + 1) % reb.length]]);
+    // Nose bridge + tip
+    const nose = [6, 168, 197, 195, 5, 4, 1, 19, 94, 2, 98, 327, 460, 294, 459, 458, 461, 354, 455, 460];
+    for (let i = 0; i < nose.length - 1; i++) c.push([nose[i], nose[i + 1]]);
+    c.push([1, 2], [2, 98], [98, 327]);
+    // Lips outer
+    const lo = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185];
+    for (let i = 0; i < lo.length; i++) c.push([lo[i], lo[(i + 1) % lo.length]]);
+    // Lips inner
+    const li = [78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95];
+    for (let i = 0; i < li.length; i++) c.push([li[i], li[(i + 1) % li.length]]);
+    // Face oval
+    const oval = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109];
+    for (let i = 0; i < oval.length; i++) c.push([oval[i], oval[(i + 1) % oval.length]]);
+    // Dense horizontal+vertical grid across the face for KYC wireframe look
+    // Cheeks and jaw connectors
+    const cheeks = [
+      234, 93, 132, 58, 172, 136, 150, 149, 176, 148, 152, 377, 400, 378, 379, 365, 397, 288, 361, 323, 454
+    ];
+    for (let i = 0; i < cheeks.length; i++) c.push([cheeks[i], cheeks[(i + 1) % cheeks.length]]);
+    // Forehead connectors
+    const forehead = [109, 67, 103, 54, 21, 162, 127, 234];
+    for (let i = 0; i < forehead.length; i++) c.push([forehead[i], 10]);
+    // Vertical connectors: forehead → nose → chin
+    c.push([10, 151], [151, 9], [9, 8], [8, 168], [168, 6], [6, 197], [197, 195], [195, 5], [5, 4], [4, 1], [1, 19], [19, 94], [94, 2], [2, 200], [200, 199], [199, 175], [175, 152]);
+    // Horizontal brow-to-brow
+    c.push([107, 336], [105, 334], [66, 296], [70, 300], [55, 285], [65, 295], [52, 282], [53, 283], [46, 276]);
+    // Eye-to-brow connectors
+    c.push([33, 46], [133, 53], [173, 52], [157, 65], [158, 55], [159, 70], [160, 63], [161, 105], [246, 107]);
+    c.push([362, 276], [263, 283], [249, 282], [390, 295], [373, 285], [374, 300], [380, 293], [381, 334], [382, 296], [398, 336]);
+    // Nose-to-eye connectors
+    c.push([6, 33], [6, 362], [168, 133], [168, 263], [197, 157], [197, 390], [195, 158], [195, 373], [5, 159], [5, 374]);
+    // Nose-to-lips
+    c.push([2, 0], [2, 17], [200, 37], [200, 267]);
+    // Lips-to-chin
+    c.push([17, 199], [37, 175], [267, 175]);
+    // Jaw-to-cheek dense grid
+    for (let i = 0; i < 16; i++) {
+      const top = [234, 127, 162, 21, 54, 103, 67, 109, 10, 338, 297, 332, 284, 251, 389, 356, 454][i];
+      const bot = [93, 132, 58, 172, 136, 150, 149, 176, 148, 152, 377, 400, 378, 379, 365, 397, 288][i] || 152;
+      if (top && bot) c.push([top, bot]);
     }
-    ctx.closePath();
-    ctx.stroke();
-  }
+    // Eye region dense fill
+    for (const [a, b] of [[33,133],[133,155],[155,145],[145,159],[159,163],[246,161],[161,144],[144,153],[153,154],[154,157],[157,173],[173,158],[158,160],[160,7],[7,163]] as [number,number][]) c.push([a,b]);
+    for (const [a, b] of [[362,263],[263,249],[249,390],[390,373],[373,380],[398,381],[381,374],[374,384],[384,385],[385,386],[386,387],[387,388],[388,466],[466,382]] as [number,number][]) c.push([a,b]);
+    return c;
+  })();
+
+  // Point indices to draw as subtle dots (key junction points)
+  const KEY_POINTS = new Set([
+    ...Array.from({length: 468}, (_, i) => i).filter(i =>
+      i < 200 || i > 350 || [0,17,61,291,152,10,109,67,103,54,21,162,127,234,93,132,58,172,136,150,149,176,148,377,400,378,379,365,397,288,361,323,454,338,297,332,284,251,389,356].includes(i)
+    )
+  ]);
 
   function drawOverlay(video: HTMLVideoElement) {
     const canvas = overlayRef.current;
@@ -178,36 +223,32 @@ export default function FacePage() {
     const pts = landmarks[0];
     const w = canvas.width, h = canvas.height;
     const positioned = faceIsWellPositioned();
-    const alpha = positioned ? "0.8" : "0.3";
+    const color = positioned ? "rgba(56, 189, 248, 0.7)" : "rgba(56, 189, 248, 0.25)";
+    const dotColor = positioned ? "rgba(56, 189, 248, 0.9)" : "rgba(56, 189, 248, 0.3)";
 
-    // Face oval
-    drawMeshLine(ctx, pts, FACE_OVAL, w, h, `rgba(255,255,255,${alpha})`, 2);
+    // Draw all tessellation edges as thin semi-transparent lines
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 0.8;
+    ctx.beginPath();
+    for (const [a, b] of TESSELATION) {
+      const pa = pts[a], pb = pts[b];
+      if (!pa || !pb) continue;
+      ctx.moveTo(pa.x * w, pa.y * h);
+      ctx.lineTo(pb.x * w, pb.y * h);
+    }
+    ctx.stroke();
 
-    // Eyes
-    drawMeshLine(ctx, pts, LEFT_EYE, w, h, `rgba(96,165,250,${alpha})`, 1.5);
-    drawMeshLine(ctx, pts, RIGHT_EYE, w, h, `rgba(96,165,250,${alpha})`, 1.5);
-
-    // Eyebrows
-    drawMeshLine(ctx, pts, LEFT_EYEBROW, w, h, `rgba(250,204,21,${alpha})`, 2);
-    drawMeshLine(ctx, pts, RIGHT_EYEBROW, w, h, `rgba(250,204,21,${alpha})`, 2);
-
-    // Nose
-    drawMeshLine(ctx, pts, NOSE_BRIDGE, w, h, `rgba(168,85,247,${alpha})`, 1.5);
-    drawMeshLine(ctx, pts, NOSE_TIP, w, h, `rgba(168,85,247,${alpha})`, 1.5);
-
-    // Lips
-    drawMeshLine(ctx, pts, LIPS_OUTER, w, h, `rgba(239,68,68,${alpha})`, 1.5);
-    drawMeshLine(ctx, pts, LIPS_INNER, w, h, `rgba(239,68,68,${alpha})`, 1);
-
-    // Iris centers
-    if (pts[468] && pts[473]) {
-      [[468,4],[473,4]].forEach(([idx,r]) => {
-        const p = pts[idx as number];
-        ctx.fillStyle = `rgba(255,255,255,${alpha})`;
-        ctx.beginPath();
-        ctx.arc(p.x * w, p.y * h, (r as number), 0, Math.PI * 2);
-        ctx.fill();
-      });
+    // Draw junction points as subtle dots
+    ctx.fillStyle = dotColor;
+    for (let i = 0; i < 468; i++) {
+      const p = pts[i];
+      if (!p) continue;
+      // Denser dots on key features, sparser elsewhere
+      const isKey = KEY_POINTS.has(i);
+      const r = isKey ? 1.2 : 0.6;
+      ctx.beginPath();
+      ctx.arc(p.x * w, p.y * h, r, 0, Math.PI * 2);
+      ctx.fill();
     }
   }
 
