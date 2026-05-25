@@ -14,7 +14,6 @@ import {
   XCircle,
   UserPlus,
   Fingerprint,
-  Upload,
 } from "lucide-react";
 
 type Mode = "enroll" | "verify";
@@ -34,7 +33,6 @@ export default function FacePage() {
   const [statusText, setStatusText] = useState("");
   const [error, setError] = useState<string | null>(null);
 
-  // Results
   const [enrolledUserId, setEnrolledUserId] = useState("");
   const [verifyResult, setVerifyResult] = useState<{
     matched: boolean;
@@ -43,9 +41,8 @@ export default function FacePage() {
     user_id: string;
   } | null>(null);
 
-  // Camera refs
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const overlayRef = useRef<HTMLCanvasElement | null>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const overlayRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const animRef = useRef<number | null>(null);
 
@@ -63,10 +60,11 @@ export default function FacePage() {
       .catch(() => setToken("dev_token"));
   }, []);
 
-  // ── Camera helpers ──────────────────────────────────────────────
+  // ── Camera ─────────────────────────────────────────────────────
 
   const stopCamera = useCallback(() => {
     if (animRef.current) cancelAnimationFrame(animRef.current);
+    animRef.current = null;
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
   }, []);
@@ -83,10 +81,10 @@ export default function FacePage() {
       });
       streamRef.current = stream;
 
-      const video = document.createElement("video");
-      video.setAttribute("playsinline", "");
+      // Use the DOM video element from JSX, not a detached one
+      const video = videoRef.current;
+      if (!video) throw new Error("Video element not mounted");
       video.srcObject = stream;
-      videoRef.current = video;
       await video.play();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Camera access denied");
@@ -94,15 +92,15 @@ export default function FacePage() {
     }
   }, []);
 
-  // Transition to scanning when ready
+  // Transition to scanning when models + camera are ready
   useEffect(() => {
-    if (isReady && videoRef.current && status === "preparing") {
+    if (isReady && videoRef.current?.readyState && videoRef.current.readyState >= 2 && status === "preparing") {
       setStatus("scanning");
       setStatusText(mode === "enroll" ? "Position face to enroll" : "Position face to verify");
     }
   }, [isReady, status, mode]);
 
-  // ── Face positioning ────────────────────────────────────────────
+  // ── Face positioning ──────────────────────────────────────────
 
   function faceIsWellPositioned(): boolean {
     if (!landmarks || landmarks.length === 0) return false;
@@ -121,7 +119,7 @@ export default function FacePage() {
     return area > 0.08 && dist < 0.25;
   }
 
-  // ── Overlay drawing ─────────────────────────────────────────────
+  // ── Overlay ────────────────────────────────────────────────────
 
   function drawOverlay() {
     const canvas = overlayRef.current;
@@ -135,13 +133,12 @@ export default function FacePage() {
 
     if (landmarks && landmarks.length > 0) {
       const pts = landmarks[0];
-      ctx.fillStyle = "rgba(59, 130, 246, 0.5)";
+      ctx.fillStyle = "rgba(59, 130, 246, 0.55)";
       for (const p of pts) {
         ctx.beginPath();
         ctx.arc(p.x * canvas.width, p.y * canvas.height, 1.6, 0, Math.PI * 2);
         ctx.fill();
       }
-      // Oval guide
       const chin = pts[152], forehead = pts[10];
       const left = pts[234], right = pts[454];
       const cx = ((left.x + right.x) / 2) * canvas.width;
@@ -157,7 +154,7 @@ export default function FacePage() {
     }
   }
 
-  // ── Frame loop ──────────────────────────────────────────────────
+  // ── Frame loop ─────────────────────────────────────────────────
 
   useEffect(() => {
     if (status !== "scanning" && status !== "capturing") return;
@@ -178,7 +175,7 @@ export default function FacePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status, landmarks]);
 
-  // ── Auto-capture trigger ────────────────────────────────────────
+  // ── Auto-capture ───────────────────────────────────────────────
 
   const captureRef = useRef(false);
   const stableRef = useRef(0);
@@ -195,12 +192,16 @@ export default function FacePage() {
       }
     } else {
       stableRef.current = 0;
-      setStatusText(mode === "enroll" ? "Center face to enroll" : "Center face to verify");
+      if (faceDetected) {
+        setStatusText("Center your face in the oval");
+      } else {
+        setStatusText(mode === "enroll" ? "Position face to enroll" : "Position face to verify");
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [landmarks, status]);
 
-  // ── Action (enroll or verify) ───────────────────────────────────
+  // ── Enroll / Verify ────────────────────────────────────────────
 
   async function handleAction() {
     setStatus("capturing");
@@ -223,7 +224,6 @@ export default function FacePage() {
       width: (maxX - minX) * video.videoWidth, height: (maxY - minY) * video.videoHeight,
     };
 
-    // Burst capture + liveness
     let bestLiveness = 0;
     let bestBlob: Blob | null = null;
     for (let i = 0; i < 3; i++) {
@@ -261,11 +261,13 @@ export default function FacePage() {
           headers: { Authorization: `Bearer ${token}` },
           body: formData,
         });
-        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `HTTP ${res.status}`);
+        if (!res.ok) {
+          const detail = (await res.json().catch(() => ({}))).detail || `HTTP ${res.status}`;
+          throw new Error(detail);
+        }
         const data = await res.json();
         setEnrolledUserId(data.user_id);
         setStatus("done");
-        setStatusText("");
       } else {
         if (!enrolledUserId) {
           setError("Enroll a face first before verifying");
@@ -281,11 +283,13 @@ export default function FacePage() {
           headers: { Authorization: `Bearer ${token}` },
           body: formData,
         });
-        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `HTTP ${res.status}`);
+        if (!res.ok) {
+          const detail = (await res.json().catch(() => ({}))).detail || `HTTP ${res.status}`;
+          throw new Error(detail);
+        }
         const data = await res.json();
         setVerifyResult(data);
         setStatus("done");
-        setStatusText("");
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Request failed");
@@ -309,14 +313,12 @@ export default function FacePage() {
     startCamera();
   }
 
-  // Cleanup on unmount
   useEffect(() => { return stopCamera; }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const showVideo = status === "preparing" || status === "scanning" || status === "capturing";
 
   return (
     <div className="flex min-h-screen flex-col bg-zinc-950 text-zinc-100">
-      {/* Header */}
       <header className="flex items-center gap-3 border-b border-zinc-800 px-4 py-3">
         <Link href="/" className="rounded-full p-1.5 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200">
           <ArrowLeft className="h-5 w-5" />
@@ -334,8 +336,7 @@ export default function FacePage() {
               mode === "enroll" ? "bg-blue-600 text-white" : "text-zinc-400 hover:text-zinc-200"
             }`}
           >
-            <UserPlus className="mr-2 inline h-4 w-4" />
-            Enroll
+            <UserPlus className="mr-2 inline h-4 w-4" /> Enroll
           </button>
           <button
             onClick={() => { setMode("verify"); stopCamera(); setStatus("idle"); setError(null); setVerifyResult(null); }}
@@ -343,12 +344,11 @@ export default function FacePage() {
               mode === "verify" ? "bg-blue-600 text-white" : "text-zinc-400 hover:text-zinc-200"
             }`}
           >
-            <Fingerprint className="mr-2 inline h-4 w-4" />
-            Verify
+            <Fingerprint className="mr-2 inline h-4 w-4" /> Verify
           </button>
         </div>
 
-        {/* Idle state — start button */}
+        {/* Idle */}
         {status === "idle" && (
           <div className="flex flex-1 flex-col items-center justify-center gap-4">
             <p className="text-sm text-zinc-400">
@@ -356,23 +356,17 @@ export default function FacePage() {
                 ? "Capture a face to create a new identity enrollment"
                 : "Capture a face to verify against the enrolled identity"}
             </p>
-            <button
-              onClick={handleStart}
-              className="flex items-center gap-2 rounded-xl bg-blue-600 px-6 py-3 text-sm font-medium text-white hover:bg-blue-500"
-            >
-              <Camera className="h-5 w-5" />
-              Start Camera
+            <button onClick={handleStart}
+              className="flex items-center gap-2 rounded-xl bg-blue-600 px-6 py-3 text-sm font-medium text-white hover:bg-blue-500">
+              <Camera className="h-5 w-5" /> Start Camera
             </button>
             {mode === "verify" && (
-              <div className="mt-2">
+              <div className="mt-2 w-full">
                 <label className="text-xs text-zinc-500">User ID to verify</label>
-                <input
-                  type="text"
-                  value={enrolledUserId}
+                <input type="text" value={enrolledUserId}
                   onChange={(e) => setEnrolledUserId(e.target.value)}
                   placeholder="Paste user_id from enrollment..."
-                  className="mt-1 w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-200"
-                />
+                  className="mt-1 w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-200" />
               </div>
             )}
           </div>
@@ -382,17 +376,12 @@ export default function FacePage() {
         <div className="relative w-full overflow-hidden rounded-2xl bg-black" style={{ maxWidth: 400 }}>
           {showVideo && (
             <div className="relative">
-              <video
-                ref={(el) => { if (el && videoRef.current !== el) videoRef.current = el; }}
-                autoPlay playsInline muted
+              <video ref={videoRef} autoPlay playsInline muted
                 className="h-full w-full object-cover"
-                style={{ aspectRatio: "3/4", transform: "scaleX(-1)" }}
-              />
-              <canvas
-                ref={overlayRef}
+                style={{ aspectRatio: "3/4", transform: "scaleX(-1)" }} />
+              <canvas ref={overlayRef}
                 className="pointer-events-none absolute inset-0 h-full w-full"
-                style={{ transform: "scaleX(-1)" }}
-              />
+                style={{ transform: "scaleX(-1)" }} />
             </div>
           )}
 
@@ -406,7 +395,8 @@ export default function FacePage() {
           )}
 
           {status === "done" && (
-            <div className={`flex items-center justify-center ${mode === "enroll" || verifyResult?.matched ? "bg-green-950/50" : "bg-red-950/50"}`} style={{ aspectRatio: "3/4" }}>
+            <div className={`flex items-center justify-center ${mode === "enroll" || verifyResult?.matched ? "bg-green-950/50" : "bg-red-950/50"}`}
+              style={{ aspectRatio: "3/4" }}>
               <div className="flex flex-col items-center gap-3">
                 {(mode === "enroll" || verifyResult?.matched) ? (
                   <CheckCircle className="h-16 w-16 text-green-400" />
@@ -421,20 +411,20 @@ export default function FacePage() {
           )}
         </div>
 
-        {/* Status text */}
+        {/* Status bar */}
         <div className="mt-4 flex flex-col items-center gap-2 text-center">
           {(status === "scanning" || status === "capturing") && (
             <div className="flex items-center gap-2 text-sm text-zinc-400">
               <Camera className="h-4 w-4" /> {statusText}
             </div>
           )}
-
           {status === "error" && (
             <div className="flex flex-col items-center gap-3">
               <div className="flex items-center gap-2 rounded-lg bg-red-500/10 px-4 py-3 text-sm text-red-400">
                 <XCircle className="h-4 w-4" /> {error || "Error"}
               </div>
-              <button onClick={handleStart} className="rounded-full bg-blue-600 px-6 py-2.5 text-sm font-medium text-white hover:bg-blue-500">
+              <button onClick={handleStart}
+                className="rounded-full bg-blue-600 px-6 py-2.5 text-sm font-medium text-white hover:bg-blue-500">
                 Try Again
               </button>
             </div>
@@ -449,18 +439,16 @@ export default function FacePage() {
                 <h2 className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">Enrollment Result</h2>
                 <div className="space-y-2 text-sm">
                   <div className="flex items-center gap-2 text-green-400">
-                    <CheckCircle className="h-4 w-4" /> Face enrolled successfully
+                    <CheckCircle className="h-4 w-4" /> Face enrolled
                   </div>
                   <div>
                     <span className="text-zinc-500">User ID: </span>
                     <code className="rounded bg-zinc-800 px-2 py-0.5 text-xs text-zinc-200 break-all">{enrolledUserId}</code>
                   </div>
-                  <p className="text-xs text-zinc-500">Switch to <strong>Verify</strong> tab to test against this identity</p>
+                  <p className="text-xs text-zinc-500">Switch to <strong>Verify</strong> tab to test matching.</p>
                 </div>
-                <button
-                  onClick={() => { setMode("verify"); setStatus("idle"); }}
-                  className="mt-3 flex w-full items-center justify-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500"
-                >
+                <button onClick={() => { setMode("verify"); setStatus("idle"); }}
+                  className="mt-3 flex w-full items-center justify-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500">
                   <Fingerprint className="h-4 w-4" /> Switch to Verify
                 </button>
               </div>
@@ -489,7 +477,8 @@ export default function FacePage() {
                     </div>
                   </div>
                 </div>
-                <button onClick={handleStart} className="mt-3 w-full rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500">
+                <button onClick={handleStart}
+                  className="mt-3 w-full rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500">
                   Test Again
                 </button>
               </div>

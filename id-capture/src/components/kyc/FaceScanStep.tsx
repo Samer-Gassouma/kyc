@@ -69,10 +69,9 @@ export default function FaceScanStep({
       });
       streamRef.current = stream;
 
-      const video = document.createElement("video");
-      video.setAttribute("playsinline", "");
+      const video = videoRef.current;
+      if (!video) throw new Error("Video element not mounted");
       video.srcObject = stream;
-      videoRef.current = video;
       await video.play();
     } catch (err) {
       setCamError(
@@ -391,11 +390,7 @@ export default function FaceScanStep({
         {showVideo && (
           <div className="relative">
             <video
-              ref={(el) => {
-                if (el && videoRef.current !== el) {
-                  videoRef.current = el;
-                }
-              }}
+              ref={videoRef}
               autoPlay
               playsInline
               muted
