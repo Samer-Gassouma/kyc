@@ -129,6 +129,74 @@ front_id → back_id → face_scan → extraction (background) → completed
 
 Images are encrypted (AES-256-GCM) before S3 upload. S3 keys stored in `captures` table. OCR results stored as JSON in `kyc_results`. Celery workers notify completion via Redis Pub/Sub on `kyc:capture:{id}:done` channel.
 
+## Deployment
+
+### VPS (Azure)
+
+| Detail | Value |
+|---|---|
+| SSH alias | `ssh kyc` |
+| Host | `4.233.137.88` |
+| User | `ivan` |
+| Key | `~/.ssh/KYC_key.pem` |
+| OS | Ubuntu 24.04 LTS (x86_64) |
+
+### Production URLs
+
+| Service | URL |
+|---|---|
+| KYC Portal | `https://terraintel.fun` |
+| Full KYC Flow | `https://terraintel.fun/kyc` |
+| Face Pipeline Test | `https://terraintel.fun/face` |
+| CIN Extraction | `https://terraintel.fun/extract` |
+| Backend Health | `https://terraintel.fun/api/health` |
+
+### Systemd Services
+
+```bash
+sudo systemctl status kyc-backend    # FastAPI on :8000
+sudo systemctl status kyc-celery     # Celery OCR worker
+sudo systemctl status kyc-frontend   # Next.js on :3000
+```
+
+Logs: `sudo journalctl -u kyc-backend -f`
+
+### Deploy Commands
+
+```bash
+# From local machine:
+cd /home/ivan/kyc
+git add . && git commit -m "..." && git push origin master
+
+# Then SSH to VPS and:
+git -C /home/ivan/kyc fetch origin master
+git -C /home/ivan/kyc reset --hard origin/master
+npm install --prefix /home/ivan/kyc/id-capture    # if package.json changed
+npm run build --prefix /home/ivan/kyc/id-capture
+sudo systemctl restart kyc-backend kyc-celery kyc-frontend
+```
+
+### Database Access
+
+```bash
+# PostgreSQL (face data)
+sudo -u postgres psql -d kyc
+
+# SQLite (KYC operational data)
+sqlite3 /home/ivan/kyc/backend/kyc.db
+
+# Check landmarks stored:
+sudo -u postgres psql -d kyc -c "SELECT COUNT(*) as total, COUNT(landmarks_3d) as has_lm FROM face_profiles;"
+```
+
+### NGINX
+
+Site config at `/etc/nginx/sites-enabled/kyc`. Proxies:
+- `/` → `http://localhost:3000` (Next.js frontend)
+- `/api/*` → `http://localhost:8000` (FastAPI backend)
+- `/ws/*` → WebSocket passthrough to backend
+- SSL via Let's Encrypt (`terraintel.fun`)
+
 ### Notes
 
 - Model weights in `backend/weights/` are gitignored — run `scripts/setup_models.py`
