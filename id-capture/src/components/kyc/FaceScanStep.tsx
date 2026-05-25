@@ -3,161 +3,113 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { canvasToJpegBlob, grabFrame } from "@/lib/frameEncoder";
 import { API_BASE } from "@/lib/apiBase";
-import { useFaceDetection } from "@/hooks/useFaceDetection";
+import { useFaceDetection, REGION_EDGES } from "@/hooks/useFaceDetection";
 import { CheckCircle, Loader2, XCircle, Camera } from "lucide-react";
 
-interface FaceScanStepProps {
-  token: string;
-  userId: string;
-  onComplete: (result: { passed: boolean; confidence: number; user_id: string }) => void;
-}
-
-type ScanState = "idle" | "preparing" | "scanning" | "verifying" | "passed" | "failed";
+interface FaceScanStepProps { token: string; userId: string; onComplete: (r: { passed: boolean; confidence: number; user_id: string }) => void; }
+type State = "idle"|"preparing"|"scanning"|"verifying"|"passed"|"failed";
 
 export default function FaceScanStep({ token, userId, onComplete }: FaceScanStepProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const animRef = useRef<number>(0);
-  const onCompleteRef = useRef(onComplete);
-  onCompleteRef.current = onComplete;
+  const streamRef = useRef<MediaStream|null>(null);
+  const animRef = useRef(0);
+  const onC = useRef(onComplete); onC.current=onComplete;
   const stableRef = useRef(0);
+  const dCanvasRef = useRef<HTMLCanvasElement|null>(null);
 
-  const [scanState, setScanState] = useState<ScanState>("idle");
-  const [camError, setCamError] = useState<string | null>(null);
-  const [statusText, setStatusText] = useState("");
+  const [state, setState] = useState<State>("idle");
+  const [error, setError] = useState<string|null>(null);
+  const [msg, setMsg] = useState("");
   const [confidence, setConfidence] = useState(0);
-  const [progress, setProgress] = useState(0);
-  const [glow, setGlow] = useState<"none" | "yellow" | "green">("none");
+  const [cd, setCd] = useState(0);
 
   const { isReady, detect } = useFaceDetection();
 
-  const cleanup = useCallback(() => {
-    if (animRef.current) cancelAnimationFrame(animRef.current);
-    streamRef.current?.getTracks().forEach(t => t.stop());
-    streamRef.current = null;
+  const cleanup = useCallback(() => { cancelAnimationFrame(animRef.current); streamRef.current?.getTracks().forEach(t=>t.stop()); streamRef.current=null; }, []);
+
+  const startCam = useCallback(async () => {
+    try { setState("preparing"); setMsg("Loading...");
+      const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:"user",width:{ideal:640},height:{ideal:480}},audio:false});
+      streamRef.current=s; const v=videoRef.current; if(!v) throw new Error("no video"); v.srcObject=s; await v.play(); }
+    catch(e) { setError(e instanceof Error?e.message:"Camera"); setState("failed"); }
   }, []);
 
-  const startCamera = useCallback(async () => {
-    try {
-      setScanState("preparing"); setStatusText("Loading face detection...");
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } }, audio: false,
-      });
-      streamRef.current = stream;
-      const v = videoRef.current; if (!v) throw new Error("no video");
-      v.srcObject = stream; await v.play();
-    } catch (err) {
-      setCamError(err instanceof Error ? err.message : "Camera"); setScanState("failed");
-    }
-  }, []);
-
-  useEffect(() => { startCamera(); return cleanup; }, []); // eslint-disable-line
+  useEffect(()=>{startCam();return cleanup;},[]); // eslint-disable-line
+  useEffect(()=>{ if(isReady&&videoRef.current&&videoRef.current.videoWidth>0&&state==="preparing") {setState("scanning");setMsg("Position your face");} },[isReady,state]);
 
   useEffect(() => {
-    if (isReady && videoRef.current && videoRef.current.videoWidth > 0 && scanState === "preparing") {
-      setScanState("scanning"); setStatusText("Center your face in the oval");
-    }
-  }, [isReady, scanState]);
+    if (state!=="scanning") return;
+    let running=true;
+    if (!dCanvasRef.current) dCanvasRef.current=document.createElement("canvas");
 
-  // Frame loop
-  useEffect(() => {
-    if (scanState !== "scanning") return;
-    let running = true, busy = false;
-
-    async function loop() {
+    const loop = () => {
       if (!running) return;
-      const video = videoRef.current;
-      if (!video || video.videoWidth === 0 || busy) { animRef.current = requestAnimationFrame(loop); return; }
-      busy = true;
-      let res;
-      try { res = await detect(video); } catch { res = null; }
-      busy = false;
+      const v=videoRef.current, dc=dCanvasRef.current;
+      if (!v||v.videoWidth===0||!dc) { animRef.current=requestAnimationFrame(loop); return; }
+
+      const { landmarks, faceDetected } = detect(v, dc);
       if (!running) return;
 
-      if (res) {
-        const centered = res.pose === "center";
-        drawOval(video, res.box, centered ? "green" : "yellow", 0);
-        setGlow(centered ? "green" : "yellow");
-        if (centered) {
-          stableRef.current = Math.min(25, stableRef.current + 1);
-          setProgress(Math.round((stableRef.current / 25) * 100));
-          setStatusText("Hold still...");
-          if (stableRef.current >= 25) {
-            running = false;
-            await doCapture(video);
-            return;
-          }
-        } else {
-          stableRef.current = Math.max(0, stableRef.current - 2);
-          setProgress(Math.round((stableRef.current / 25) * 100));
-          setStatusText("Center your face in the oval");
-        }
+      if (faceDetected && landmarks[0]) {
+        const pts=landmarks[0];
+        const b=bbox(pts,v.videoWidth,v.videoHeight);
+        drawMesh(overlayRef.current!,pts,v.videoWidth,v.videoHeight);
+
+        if (b.width/v.videoWidth>0.25) {
+          stableRef.current++;
+          const r=Math.max(0,Math.ceil((50-stableRef.current)/30));
+          setCd(r);
+          if (stableRef.current>=50) { running=false; doCapture(v); return; }
+          setMsg(r>0?`Hold still... ${r}`:"Scanning...");
+        } else { stableRef.current=Math.max(0,stableRef.current-1); setCd(0); setMsg("Move closer"); }
       } else {
-        drawOval(video, null, "none", 0);
-        setGlow("none"); stableRef.current = 0; setProgress(0);
-        setStatusText("Position your face");
+        stableRef.current=Math.max(0,stableRef.current-3); setCd(0); setMsg("No face detected");
+        const ov=overlayRef.current; if(ov){const c=ov.getContext("2d");if(c)c.clearRect(0,0,ov.width,ov.height);}
       }
-      animRef.current = requestAnimationFrame(loop);
-    }
-    animRef.current = requestAnimationFrame(loop);
-    return () => { running = false; };
+      animRef.current=requestAnimationFrame(loop);
+    };
+    animRef.current=requestAnimationFrame(loop);
+    return ()=>{running=false;};
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scanState]);
+  }, [state]);
 
-  async function doCapture(video: HTMLVideoElement) {
-    setScanState("verifying"); setStatusText("Verifying...");
-    const c = document.createElement("canvas");
-    grabFrame(video, c);
-    const blob = await canvasToJpegBlob(c, 0.85);
+  async function doCapture(video:HTMLVideoElement) {
+    setState("verifying"); setMsg("Verifying...");
+    const c=document.createElement("canvas"); grabFrame(video,c);
+    const blob=await canvasToJpegBlob(c,0.85);
     try {
-      const fd = new FormData(); fd.append("image", blob, "face.jpg"); fd.append("user_id", userId);
-      const res = await fetch(`${API_BASE}/api/face/verify`, { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: fd });
-      if (!res.ok) throw new Error((await res.json().catch(()=>({}))).detail || `HTTP ${res.status}`);
-      const data = await res.json();
-      setConfidence(data.confidence);
-      if (data.matched) { setScanState("passed"); onCompleteRef.current({ passed: true, confidence: data.confidence, user_id: data.user_id }); }
-      else { setScanState("failed"); setCamError(`No match (${(data.confidence*100).toFixed(0)}%)`); }
-    } catch (err) { setScanState("failed"); setCamError(err instanceof Error ? err.message : "Verification failed"); }
+      const fd=new FormData(); fd.append("image",blob,"face.jpg"); fd.append("user_id",userId);
+      const res=await fetch(`${API_BASE}/api/face/verify`,{method:"POST",headers:{Authorization:`Bearer ${token}`},body:fd});
+      if(!res.ok) throw new Error((await res.json().catch(()=>({}))).detail||`HTTP ${res.status}`);
+      const d=await res.json(); setConfidence(d.confidence);
+      if(d.matched){setState("passed");onC.current({passed:true,confidence:d.confidence,user_id:d.user_id});}
+      else{setState("failed");setError(`No match (${(d.confidence*100).toFixed(0)}%)`);}
+    } catch(e) { setState("failed"); setError(e instanceof Error?e.message:"Verification failed"); }
   }
 
-  function drawOval(video: HTMLVideoElement, box: any, g: string, _p: number) {
-    const canvas = overlayRef.current;
-    if (!canvas || !video) return;
-    canvas.width = video.videoWidth; canvas.height = video.videoHeight;
-    const ctx = canvas.getContext("2d"); if (!ctx) return;
-    const w = canvas.width, h = canvas.height;
-    ctx.clearRect(0, 0, w, h);
-    const ox = w / 2, oy = h / 2.1, orx = w * 0.21, ory = h * 0.29;
-    const gc = g === "green" ? "rgba(34,197,94,0.5)" : g === "yellow" ? "rgba(234,179,8,0.5)" : "rgba(255,255,255,0.12)";
-    ctx.save();
-    ctx.shadowColor = g === "green" ? "#22c55e" : g === "yellow" ? "#eab308" : "#ffffff";
-    ctx.shadowBlur = g === "green" ? 22 : g === "yellow" ? 15 : 6;
-    ctx.strokeStyle = gc; ctx.lineWidth = 3;
-    ctx.beginPath(); ctx.ellipse(ox, oy, orx, ory, 0, 0, Math.PI * 2); ctx.stroke();
-    ctx.restore();
-    if (box) { ctx.strokeStyle = "rgba(255,255,255,0.12)"; ctx.lineWidth = 1; ctx.strokeRect(box.x, box.y, box.width, box.height); }
-  }
+  function bbox(pts:any[],vw:number,vh:number){let x=Infinity,y=Infinity,X=-Infinity,Y=-Infinity;for(const p of pts){if(p.x<x)x=p.x;if(p.x>X)X=p.x;if(p.y<y)y=p.y;if(p.y>Y)Y=p.y;}return{x:x*vw,y:y*vh,width:(X-x)*vw,height:(Y-y)*vh};}
+  function drawMesh(canvas:HTMLCanvasElement,pts:any[],vw:number,vh:number){canvas.width=vw;canvas.height=vh;const ctx=canvas.getContext("2d");if(!ctx||pts.length<400)return;ctx.clearRect(0,0,vw,vh);for(const[,r] of Object.entries(REGION_EDGES)){ctx.strokeStyle=r.color+"99";ctx.lineWidth=1.4;ctx.beginPath();for(const[a,b]of r.edges){if(a>=pts.length||b>=pts.length)continue;ctx.moveTo(pts[a].x*vw,pts[a].y*vh);ctx.lineTo(pts[b].x*vw,pts[b].y*vh);}ctx.stroke();}ctx.fillStyle="rgba(255,255,255,0.5)";for(let i=0;i<pts.length;i+=3){ctx.beginPath();ctx.arc(pts[i].x*vw,pts[i].y*vh,1.1,0,Math.PI*2);ctx.fill();}}
+  function retry(){stableRef.current=0;setCd(0);setError(null);cleanup();startCam();}
 
-  function handleRetry() { stableRef.current = 0; setProgress(0); setCamError(null); cleanup(); startCamera(); }
-
-  return (
+  return(
     <div className="flex flex-col items-center gap-4">
-      {camError && <div className="flex flex-col items-center gap-3 p-4 text-center"><p className="text-sm text-red-400">{camError}</p><button onClick={handleRetry} className="rounded-full bg-blue-600 px-4 py-2 text-sm text-white">Retry</button></div>}
-      <div className="relative w-full overflow-hidden rounded-2xl bg-black" style={{ maxWidth: 400 }}>
-        {(scanState === "preparing" || scanState === "scanning") && (
+      {error&&<div className="flex flex-col items-center gap-3 p-4 text-center"><p className="text-sm text-red-400">{error}</p><button onClick={retry} className="rounded-full bg-blue-600 px-4 py-2 text-sm text-white">Retry</button></div>}
+      <div className="relative w-full overflow-hidden rounded-2xl bg-black" style={{maxWidth:400}}>
+        {(state==="preparing"||state==="scanning")&&(
           <div className="relative">
-            <video ref={videoRef} autoPlay playsInline muted className="h-full w-full object-cover" style={{ aspectRatio: "3/4", transform: "scaleX(-1)" }} />
-            <canvas ref={overlayRef} className="pointer-events-none absolute inset-0 h-full w-full" style={{ transform: "scaleX(-1)" }} />
+            <video ref={videoRef} autoPlay playsInline muted className="h-full w-full object-cover" style={{aspectRatio:"3/4",transform:"scaleX(-1)"}}/>
+            <canvas ref={overlayRef} className="pointer-events-none absolute inset-0 h-full w-full" style={{transform:"scaleX(-1)"}}/>
+            {cd>0&&cd<=3&&<div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/30"><span className="text-7xl font-bold text-white animate-pulse">{cd}</span></div>}
           </div>
         )}
-        {scanState === "verifying" && <div className="flex items-center justify-center bg-black" style={{ aspectRatio: "3/4" }}><Loader2 className="h-10 w-10 animate-spin text-blue-400" /></div>}
-        {scanState === "passed" && <div className="flex items-center justify-center bg-green-950/50" style={{ aspectRatio: "3/4" }}><CheckCircle className="h-16 w-16 text-green-400" /></div>}
+        {state==="verifying"&&<div className="flex items-center justify-center bg-black" style={{aspectRatio:"3/4"}}><Loader2 className="h-10 w-10 animate-spin text-blue-400"/></div>}
+        {state==="passed"&&<div className="flex items-center justify-center bg-green-950/50" style={{aspectRatio:"3/4"}}><CheckCircle className="h-16 w-16 text-green-400"/></div>}
       </div>
       <div className="flex flex-col items-center gap-2 text-center">
-        {scanState === "scanning" && <><div className="flex items-center gap-2 text-sm text-zinc-400"><Camera className="h-4 w-4" />{statusText}</div>{progress > 0 && <div className="h-1 w-40 rounded-full bg-zinc-700"><div className="h-full rounded-full bg-sky-400 transition-all" style={{ width: `${progress}%` }} /></div>}</>}
-        {scanState === "passed" && <div className="flex items-center gap-2 rounded-full bg-green-600 px-5 py-2 text-sm font-medium text-white"><CheckCircle className="h-4 w-4" />Verified ({(confidence*100).toFixed(0)}%)</div>}
-        {scanState === "failed" && !camError && <div className="flex flex-col items-center gap-3"><div className="flex items-center gap-2 rounded-full bg-red-600 px-5 py-2 text-sm text-white"><XCircle className="h-4 w-4" />Failed</div><button onClick={handleRetry} className="rounded-full bg-blue-600 px-6 py-2.5 text-sm text-white">Try Again</button></div>}
+        {(state==="scanning")&&<div className="flex items-center gap-2 text-sm text-zinc-400"><Camera className="h-4 w-4"/>{msg}</div>}
+        {state==="passed"&&<div className="flex items-center gap-2 rounded-full bg-green-600 px-5 py-2 text-sm font-medium text-white"><CheckCircle className="h-4 w-4"/>Verified ({(confidence*100).toFixed(0)}%)</div>}
+        {state==="failed"&&!error&&<div className="flex flex-col items-center gap-3"><div className="flex items-center gap-2 rounded-full bg-red-600 px-5 py-2 text-sm text-white"><XCircle className="h-4 w-4"/>Failed</div><button onClick={retry} className="rounded-full bg-blue-600 px-6 py-2.5 text-sm text-white">Try Again</button></div>}
       </div>
     </div>
   );

@@ -3,328 +3,253 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { API_BASE } from "@/lib/apiBase";
 import { canvasToJpegBlob } from "@/lib/frameEncoder";
-import { useFaceDetection, type PoseState } from "@/hooks/useFaceDetection";
+import { useFaceDetection, REGION_EDGES } from "@/hooks/useFaceDetection";
 import Link from "next/link";
-import { ArrowLeft, Camera, Loader2, CheckCircle, XCircle, UserPlus, Fingerprint, ArrowUp, ArrowLeftCircle, ArrowRightCircle, Focus } from "lucide-react";
+import { ArrowLeft, Camera, Loader2, CheckCircle, XCircle, UserPlus, Fingerprint } from "lucide-react";
+import Face3DViewer from "@/components/kyc/Face3DViewer";
 
 type Mode = "enroll" | "verify";
-type Angle = "center" | "left" | "right" | "up";
-
-const ANGLES: Angle[] = ["center", "left", "right", "up"];
-const LABEL: Record<Angle, string> = {
-  center: "Center your face in the oval",
-  left: "Turn your head LEFT",
-  right: "Turn your head RIGHT",
-  up: "Tilt your head UP",
-};
-const ICON: Record<Angle, typeof Focus> = {
-  center: Focus, left: ArrowLeftCircle, right: ArrowRightCircle, up: ArrowUp,
-};
-
-const POSE_MATCH: Record<Angle, (p: PoseState) => boolean> = {
-  center: (p) => p === "center",
-  left:   (p) => p === "left",
-  right:  (p) => p === "right",
-  up:     (p) => p === "up",
-};
-
-// ── Page ──────────────────────────────────────────────────────────
 
 export default function FacePage() {
   const [mode, setMode] = useState<Mode>("enroll");
   const [token, setToken] = useState("");
-  const [phase, setPhase] = useState<"idle" | "active" | "capturing" | "verifying" | "done" | "error">("idle");
+  const [phase, setPhase] = useState<"idle"|"active"|"countdown"|"capturing"|"done"|"error">("idle");
   const [statusMsg, setStatusMsg] = useState("");
-  const [errMsg, setErrMsg] = useState<string | null>(null);
+  const [errMsg, setErrMsg] = useState<string|null>(null);
   const [userId, setUserId] = useState("");
   const [result, setResult] = useState<any>(null);
-  const [currentAngle, setCurrentAngle] = useState<Angle>("center");
-  const [angleProgress, setAngleProgress] = useState(0);
-  const [completedAngles, setCompletedAngles] = useState<Set<Angle>>(new Set());
-  const [guideGlow, setGuideGlow] = useState<"none" | "yellow" | "green">("none");
+  const [countdown, setCountdown] = useState(0);
+  const [scanPoints, setScanPoints] = useState<{x:number,y:number,z:number}[]>([]);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const animRef = useRef<number>(0);
+  const streamRef = useRef<MediaStream|null>(null);
+  const animRef = useRef(0);
   const stableRef = useRef(0);
-  const capturedFrames = useRef<Map<Angle, Blob>>(new Map());
-  const drawingRef = useRef({ box: null as any, pose: "none" as PoseState, progress: 0, glow: "none" as string, angle: "center" as string });
+  const detectCanvasRef = useRef<HTMLCanvasElement|null>(null);
 
   const { isReady, detect } = useFaceDetection();
 
   useEffect(() => {
-    fetch(`${API_BASE}/api/auth/token`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: `face_${Date.now()}` }) })
-      .then(r => r.json()).then(d => setToken(d.access_token)).catch(() => setToken("dev_token"));
+    fetch(`${API_BASE}/api/auth/token`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({session_id:`face_${Date.now()}`}) })
+      .then(r=>r.json()).then(d=>setToken(d.access_token)).catch(()=>setToken("dev_token"));
   }, []);
 
-  const stop = useCallback(() => {
-    cancelAnimationFrame(animRef.current);
-    streamRef.current?.getTracks().forEach(t => t.stop());
-    streamRef.current = null;
-  }, []);
+  const stop = useCallback(() => { cancelAnimationFrame(animRef.current); streamRef.current?.getTracks().forEach(t=>t.stop()); streamRef.current=null; }, []);
 
   const start = useCallback(async () => {
-    setErrMsg(null); setResult(null); setPhase("active");
-    setCurrentAngle("center"); setAngleProgress(0);
-    setCompletedAngles(new Set()); setGuideGlow("none");
-    capturedFrames.current.clear(); stableRef.current = 0;
-    setStatusMsg(LABEL.center);
-    drawingRef.current = { box: null, pose: "none", progress: 0, glow: "none", angle: "center" };
+    setErrMsg(null); setResult(null); setPhase("active"); setScanPoints([]);
+    stableRef.current=0; setCountdown(0); setStatusMsg("Position your face");
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } }, audio: false,
-      });
-      streamRef.current = stream;
-      const v = videoRef.current; if (!v) throw new Error("no video");
-      v.srcObject = stream; await v.play();
-    } catch (e) {
-      setErrMsg(e instanceof Error ? e.message : "Camera"); setPhase("error");
-    }
+      const stream = await navigator.mediaDevices.getUserMedia({ video:{facingMode:"user",width:{ideal:640},height:{ideal:480}}, audio:false });
+      streamRef.current=stream;
+      const v=videoRef.current; if(!v) throw new Error("no video");
+      v.srcObject=stream; await v.play();
+    } catch(e) { setErrMsg(e instanceof Error?e.message:"Camera error"); setPhase("error"); }
   }, []);
 
-  useEffect(() => stop, []); // eslint-disable-line
+  useEffect(()=>stop, []); // eslint-disable-line
 
   // ── Frame loop ─────────────────────────────────────────────────
 
   useEffect(() => {
-    if (phase !== "active") return;
-    let running = true, busy = false;
+    if (phase!=="active") return;
+    let running=true;
+    if (!detectCanvasRef.current) detectCanvasRef.current=document.createElement("canvas");
 
-    async function loop() {
+    const loop = () => {
       if (!running) return;
-      const video = videoRef.current;
-      if (!video || video.videoWidth === 0 || busy) {
-        animRef.current = requestAnimationFrame(loop);
-        return;
-      }
-      busy = true;
-      let res;
-      try { res = await detect(video); } catch { res = null; }
-      busy = false;
+      const video=videoRef.current;
+      const dCanvas=detectCanvasRef.current;
+      if (!video||video.videoWidth===0||!dCanvas) { animRef.current=requestAnimationFrame(loop); return; }
+
+      const { landmarks, faceDetected } = detect(video, dCanvas);
       if (!running) return;
 
-      const d = drawingRef.current;
-      const target = currentAngle;
+      if (faceDetected && landmarks[0]) {
+        const pts = landmarks[0];
+        const box = bbox(pts, video.videoWidth, video.videoHeight);
 
-      if (res) {
-        d.box = res.box;
-        d.pose = res.pose;
-        d.angle = target;
+        // Draw colored mesh
+        drawMesh(overlayRef.current!, pts, video.videoWidth, video.videoHeight);
 
-        const matches = POSE_MATCH[target](res.pose);
+        // Quality: face must be > 25% of frame width
+        const goodSize = box.width / video.videoWidth > 0.25;
 
-        if (matches && !capturedFrames.current.has(target)) {
-          stableRef.current = Math.min(30, stableRef.current + 1);
+        if (goodSize) {
+          stableRef.current++;
+          const remaining = Math.max(0, Math.ceil((60 - stableRef.current) / 30));
+          setCountdown(remaining);
+          if (stableRef.current >= 60) {
+            running = false;
+            setScanPoints([...pts.map(p=>({x:p.x,y:p.y,z:p.z}))]);
+            handleCapture(video, pts);
+            return;
+          }
+          setStatusMsg(remaining > 0 ? `Hold still... ${remaining}` : "Scanning...");
         } else {
-          stableRef.current = Math.max(0, stableRef.current - 2);
-        }
-
-        const pct = Math.round((stableRef.current / 30) * 100);
-        setAngleProgress(pct);
-        d.progress = pct;
-        d.glow = res.pose === "none" ? "none" : matches ? "green" : "yellow";
-        setGuideGlow(d.glow as any);
-
-        if (matches) {
-          setStatusMsg(`${LABEL[target]} — hold still`);
-        } else {
-          // Show live debug: nose position relative to box center
-          const dbg = (window as any).__pose;
-          const sx = dbg?.noseOffX != null ? ` noseOffX=${dbg.noseOffX}` : "";
-          const sy = dbg?.noseOffY != null ? ` noseOffY=${dbg.noseOffY}` : "";
-          setStatusMsg(`${LABEL[target]}${sx}${sy}`);
-        }
-
-        if (stableRef.current >= 30 && !capturedFrames.current.has(target)) {
-          busy = true;
-          await captureAngle(target, video);
-          busy = false;
-          stableRef.current = 0;
-          drawingRef.current.progress = 0;
-          setAngleProgress(0);
+          stableRef.current = Math.max(0, stableRef.current - 1);
+          setCountdown(0);
+          setStatusMsg("Move closer — face too small");
         }
       } else {
-        d.box = null; d.pose = "none"; d.progress = 0; d.glow = "none";
-        setGuideGlow("none"); setAngleProgress(0);
-        setStatusMsg("Position your face in the oval");
-        stableRef.current = 0;
+        stableRef.current = Math.max(0, stableRef.current - 3);
+        setCountdown(0);
+        setStatusMsg("No face detected");
+        // Clear overlay
+        const ov = overlayRef.current;
+        if (ov) { const c=ov.getContext("2d"); if(c) c.clearRect(0,0,ov.width,ov.height); }
       }
 
-      drawOval(video, d.box, d.glow, d.progress);
       animRef.current = requestAnimationFrame(loop);
-    }
+    };
     animRef.current = requestAnimationFrame(loop);
-    return () => { running = false; };
+    return () => { running=false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase, currentAngle]);
+  }, [phase]);
 
   // ── Capture ────────────────────────────────────────────────────
 
-  async function captureAngle(angle: Angle, video: HTMLVideoElement) {
-    setPhase("capturing");
+  async function handleCapture(video: HTMLVideoElement, pts: any[]) {
+    setPhase("capturing"); setStatusMsg("Capturing...");
+
+    // Grab frame
     const c = document.createElement("canvas");
-    c.width = video.videoWidth; c.height = video.videoHeight;
-    c.getContext("2d")!.drawImage(video, 0, 0);
-    const blob = await canvasToJpegBlob(c, 0.85);
-    capturedFrames.current.set(angle, blob);
+    c.width=video.videoWidth; c.height=video.videoHeight;
+    c.getContext("2d")!.drawImage(video,0,0);
+    const blob = await canvasToJpegBlob(c, 0.92);
 
-    const done = new Set(completedAngles); done.add(angle);
-    setCompletedAngles(done);
-
-    const idx = ANGLES.indexOf(angle);
-    if (idx < ANGLES.length - 1) {
-      setCurrentAngle(ANGLES[idx + 1]);
-      setStatusMsg(LABEL[ANGLES[idx + 1]]);
-      setAngleProgress(0);
-      drawingRef.current.progress = 0;
-      setPhase("active");
-    } else {
-      setPhase("verifying"); setStatusMsg("Processing...");
-      await verify();
-    }
-  }
-
-  async function verify() {
-    const best = capturedFrames.current.get("center") || capturedFrames.current.get(ANGLES[0])!;
     try {
-      if (mode === "enroll") {
-        const fd = new FormData(); fd.append("image", best, "face.jpg"); fd.append("liveness_score", "0.95");
-        const res = await fetch(`${API_BASE}/api/face/enroll`, { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: fd });
-        if (!res.ok) throw new Error((await res.json().catch(()=>({}))).detail || `HTTP ${res.status}`);
-        setUserId((await res.json()).user_id); setResult(await res.json());
+      if (mode==="enroll") {
+        const fd = new FormData();
+        fd.append("image", blob, "face.jpg");
+        fd.append("liveness_score", "1.0");
+        fd.append("landmarks_3d", JSON.stringify({
+          points: pts.map(p=>({x:p.x,y:p.y,z:p.z})),
+          capturedAt: Date.now(),
+          frameWidth: video.videoWidth,
+          frameHeight: video.videoHeight,
+        }));
+        const q = quality(pts);
+        fd.append("quality_score", q.toFixed(2));
+
+        const res = await fetch(`${API_BASE}/api/face/enroll`, { method:"POST", headers:{Authorization:`Bearer ${token}`}, body:fd });
+        if (!res.ok) throw new Error((await res.json().catch(()=>({}))).detail||`HTTP ${res.status}`);
+        const data = await res.json();
+        setUserId(data.user_id); setResult(data);
       } else {
         if (!userId) { setPhase("error"); setErrMsg("Enroll first or paste a user ID"); return; }
-        const fd = new FormData(); fd.append("image", best, "face.jpg"); fd.append("user_id", userId);
-        const res = await fetch(`${API_BASE}/api/face/verify`, { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: fd });
-        if (!res.ok) throw new Error((await res.json().catch(()=>({}))).detail || `HTTP ${res.status}`);
+        const fd = new FormData(); fd.append("image", blob, "face.jpg"); fd.append("user_id", userId);
+        const res = await fetch(`${API_BASE}/api/face/verify`, { method:"POST", headers:{Authorization:`Bearer ${token}`}, body:fd });
+        if (!res.ok) throw new Error((await res.json().catch(()=>({}))).detail||`HTTP ${res.status}`);
         setResult(await res.json());
       }
       setPhase("done");
-    } catch (e) { setPhase("error"); setErrMsg(e instanceof Error ? e.message : "Request failed"); }
+    } catch(e) { setPhase("error"); setErrMsg(e instanceof Error?e.message:"Request failed"); }
   }
 
   function retry() { stop(); setPhase("idle"); setErrMsg(null); setResult(null); }
 
-  // ── Oval guide drawing ─────────────────────────────────────────
+  // ── Helpers ────────────────────────────────────────────────────
 
-  function drawOval(video: HTMLVideoElement, box: any, glow: string, progress: number) {
-    const canvas = overlayRef.current;
-    if (!canvas || !video) return;
-    canvas.width = video.videoWidth; canvas.height = video.videoHeight;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    const w = canvas.width, h = canvas.height;
-    ctx.clearRect(0, 0, w, h);
+  function bbox(pts: any[], vw:number, vh:number) {
+    let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
+    for (const p of pts) { if(p.x<minX)minX=p.x; if(p.x>maxX)maxX=p.x; if(p.y<minY)minY=p.y; if(p.y>maxY)maxY=p.y; }
+    return { x:minX*vw, y:minY*vh, width:(maxX-minX)*vw, height:(maxY-minY)*vh };
+  }
 
-    // Oval params
-    const ox = w / 2, oy = h / 2.1;
-    const orx = w * 0.21, ory = h * 0.29;
+  function quality(pts: any[]): number {
+    if (pts.length<400) return 0.3;
+    const zs = pts.map(p=>p.z); const zMin=Math.min(...zs), zMax=Math.max(...zs);
+    return Math.round((0.6 + Math.min((zMax-zMin)/0.08, 1)*0.4)*100)/100;
+  }
 
-    // Glow color
-    const glowColor = glow === "green" ? "rgba(34,197,94,0.5)" : glow === "yellow" ? "rgba(234,179,8,0.5)" : "rgba(255,255,255,0.15)";
+  function drawMesh(canvas: HTMLCanvasElement, pts: any[], vw:number, vh:number) {
+    canvas.width=vw; canvas.height=vh;
+    const ctx=canvas.getContext("2d"); if(!ctx) return;
+    ctx.clearRect(0,0,vw,vh);
+    if (pts.length<400) return;
 
-    // Outer glow
-    ctx.save();
-    ctx.shadowColor = glow === "green" ? "#22c55e" : glow === "yellow" ? "#eab308" : "#ffffff";
-    ctx.shadowBlur = glow === "green" ? 25 : glow === "yellow" ? 18 : 8;
-    ctx.strokeStyle = glowColor;
-    ctx.lineWidth = 3;
-    ctx.beginPath();
-    ctx.ellipse(ox, oy, orx, ory, 0, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.restore();
-
-    // Progress arc
-    if (progress > 0 && progress < 100) {
-      const startAngle = -Math.PI / 2;
-      const endAngle = startAngle + (progress / 100) * Math.PI * 2;
-      ctx.strokeStyle = glow === "green" ? "rgba(34,197,94,0.9)" : "rgba(56,189,248,0.8)";
-      ctx.lineWidth = 4;
+    for (const [, region] of Object.entries(REGION_EDGES)) {
+      ctx.strokeStyle = region.color + "99"; // 60% alpha
+      ctx.lineWidth = 1.4;
       ctx.beginPath();
-      ctx.ellipse(ox, oy, orx + 3, ory + 3, 0, startAngle, endAngle);
+      for (const [a,b] of region.edges) {
+        if (a>=pts.length||b>=pts.length) continue;
+        ctx.moveTo(pts[a].x*vw, pts[a].y*vh);
+        ctx.lineTo(pts[b].x*vw, pts[b].y*vh);
+      }
       ctx.stroke();
     }
 
-    // Face bounding box (subtle)
-    if (box) {
-      ctx.strokeStyle = glow === "green" ? "rgba(34,197,94,0.3)" : "rgba(255,255,255,0.15)";
-      ctx.lineWidth = 1;
-      ctx.strokeRect(box.x, box.y, box.width, box.height);
+    // Small dots at every 3rd point
+    ctx.fillStyle = "rgba(255,255,255,0.5)";
+    for (let i=0; i<pts.length; i+=3) {
+      ctx.beginPath(); ctx.arc(pts[i].x*vw, pts[i].y*vh, 1.1, 0, Math.PI*2); ctx.fill();
     }
   }
-
-  const Icon = ICON[currentAngle];
 
   return (
     <div className="flex min-h-screen flex-col bg-zinc-950 text-zinc-100">
       <header className="flex items-center gap-3 border-b border-zinc-800 px-4 py-3">
-        <Link href="/" className="rounded-full p-1.5 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"><ArrowLeft className="h-5 w-5" /></Link>
-        <Fingerprint className="h-5 w-5 text-blue-400" /><h1 className="text-base font-semibold">Face Pipeline Test</h1>
+        <Link href="/" className="rounded-full p-1.5 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"><ArrowLeft className="h-5 w-5"/></Link>
+        <Fingerprint className="h-5 w-5 text-blue-400"/><h1 className="text-base font-semibold">Face Pipeline Test</h1>
       </header>
       <main className="mx-auto flex w-full max-w-md flex-1 flex-col items-center p-4">
         <div className="mb-4 flex w-full rounded-lg bg-zinc-900 p-1">
-          <button onClick={() => { setMode("enroll"); retry(); }} className={`flex-1 rounded-md px-4 py-2 text-sm font-medium ${mode === "enroll" ? "bg-blue-600 text-white" : "text-zinc-400"}`}>
-            <UserPlus className="mr-2 inline h-4 w-4" />Enroll</button>
-          <button onClick={() => { setMode("verify"); retry(); }} className={`flex-1 rounded-md px-4 py-2 text-sm font-medium ${mode === "verify" ? "bg-blue-600 text-white" : "text-zinc-400"}`}>
-            <Fingerprint className="mr-2 inline h-4 w-4" />Verify</button>
+          <button onClick={()=>{setMode("enroll");retry();}} className={`flex-1 rounded-md px-4 py-2 text-sm font-medium ${mode==="enroll"?"bg-blue-600 text-white":"text-zinc-400"}`}><UserPlus className="mr-2 inline h-4 w-4"/>Enroll</button>
+          <button onClick={()=>{setMode("verify");retry();}} className={`flex-1 rounded-md px-4 py-2 text-sm font-medium ${mode==="verify"?"bg-blue-600 text-white":"text-zinc-400"}`}><Fingerprint className="mr-2 inline h-4 w-4"/>Verify</button>
         </div>
 
-        {phase === "idle" && (
+        {phase==="idle" && (
           <div className="flex flex-1 flex-col items-center justify-center gap-4">
-            <p className="text-sm text-zinc-400">{mode === "enroll" ? "Capture your face from multiple angles" : "Verify against enrolled identity"}</p>
-            <button onClick={start} className="flex items-center gap-2 rounded-xl bg-blue-600 px-6 py-3 text-sm font-medium text-white hover:bg-blue-500"><Camera className="h-5 w-5" />Start Camera</button>
-            {mode === "verify" && <input type="text" value={userId} onChange={e => setUserId(e.target.value)} placeholder="Paste user_id from enrollment..." className="mt-2 w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-200" />}
+            <p className="text-sm text-zinc-400">{mode==="enroll"?"Face scan — hold still, auto-captures":"Verify against enrolled identity"}</p>
+            <button onClick={start} className="flex items-center gap-2 rounded-xl bg-blue-600 px-6 py-3 text-sm font-medium text-white hover:bg-blue-500"><Camera className="h-5 w-5"/>Start Camera</button>
+            {mode==="verify" && <input type="text" value={userId} onChange={e=>setUserId(e.target.value)} placeholder="Paste user_id..." className="mt-2 w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-200"/>}
           </div>
         )}
 
-        <div className="relative w-full overflow-hidden rounded-2xl bg-black" style={{ maxWidth: 400 }}>
-          {(phase === "active" || phase === "capturing") && (
+        <div className="relative w-full overflow-hidden rounded-2xl bg-black" style={{maxWidth:400}}>
+          {(phase==="active"||phase==="countdown"||phase==="capturing") && (
             <div className="relative">
-              <video ref={videoRef} autoPlay playsInline muted className="h-full w-full object-cover" style={{ aspectRatio: "3/4", transform: "scaleX(-1)" }} />
-              <canvas ref={overlayRef} className="pointer-events-none absolute inset-0 h-full w-full" style={{ transform: "scaleX(-1)" }} />
-            </div>
-          )}
-          {phase === "verifying" && <div className="flex flex-col items-center justify-center bg-black gap-3" style={{ aspectRatio: "3/4" }}><Loader2 className="h-10 w-10 animate-spin text-blue-400" /><p className="text-sm text-zinc-300">{statusMsg}</p></div>}
-          {phase === "done" && <div className={`flex items-center justify-center ${mode === "enroll" || result?.matched ? "bg-green-950/50" : "bg-red-950/50"}`} style={{ aspectRatio: "3/4" }}>{(mode === "enroll" || result?.matched) ? <CheckCircle className="h-16 w-16 text-green-400" /> : <XCircle className="h-16 w-16 text-red-400" />}</div>}
-        </div>
-
-        <div className="mt-4 flex flex-col items-center gap-2 text-center w-full">
-          {(phase === "active" || phase === "capturing") && (
-            <div className="flex items-center gap-2 mb-2">
-              {ANGLES.map((a, i) => (
-                <div key={a} className="flex items-center gap-2">
-                  <div className={`flex h-7 w-7 items-center justify-center rounded-full text-xs font-bold ${completedAngles.has(a) ? "bg-green-500 text-white" : a === currentAngle ? "bg-blue-600 text-white ring-2 ring-blue-400" : "bg-zinc-700 text-zinc-400"}`}>
-                    {completedAngles.has(a) ? <CheckCircle className="h-3.5 w-3.5" /> : i + 1}
-                  </div>
-                  {i < 3 && <div className="h-0.5 w-5 bg-zinc-700" />}
+              <video ref={videoRef} autoPlay playsInline muted className="h-full w-full object-cover" style={{aspectRatio:"3/4",transform:"scaleX(-1)"}}/>
+              <canvas ref={overlayRef} className="pointer-events-none absolute inset-0 h-full w-full" style={{transform:"scaleX(-1)"}}/>
+              {/* Countdown overlay */}
+              {countdown > 0 && countdown <= 3 && (
+                <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/30">
+                  <span className="text-7xl font-bold text-white drop-shadow-lg animate-pulse">{countdown}</span>
                 </div>
-              ))}
+              )}
             </div>
           )}
-          {phase === "active" && <div className="flex items-center gap-2 text-sm text-zinc-400"><Icon className="h-4 w-4 text-sky-400" />{isReady ? statusMsg : "Loading..."}</div>}
-          {phase === "error" && <div className="flex flex-col items-center gap-3"><p className="text-sm text-red-400"><XCircle className="mr-1 inline h-4 w-4" />{errMsg}</p><button onClick={retry} className="rounded-full bg-blue-600 px-6 py-2.5 text-sm text-white">Try Again</button></div>}
+          {phase==="done" && scanPoints.length>0 && (
+            <Face3DViewer points={scanPoints.map(p=>[p.x,p.y,p.z])} width={368} height={460}/>
+          )}
         </div>
 
-        {phase === "done" && result && (
-          <div className="mt-4 w-full space-y-3">
-            {mode === "enroll" && (
-              <div className="rounded-xl bg-zinc-900 p-4">
-                <h2 className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">Enrolled</h2>
-                <code className="block break-all rounded bg-zinc-800 p-2 text-xs text-green-400">{result.user_id}</code>
-                <button onClick={() => { setMode("verify"); setUserId(result.user_id || ""); setPhase("idle"); }} className="mt-3 w-full rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white">Switch to Verify</button>
-              </div>
-            )}
-            {mode === "verify" && (
-              <div className={`rounded-xl p-4 ${result.matched ? "bg-green-500/10 ring-1 ring-green-500/30" : "bg-red-500/10 ring-1 ring-red-500/30"}`}>
-                <h2 className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">Result</h2>
-                <p className={`text-lg font-bold ${result.matched ? "text-green-400" : "text-red-400"}`}>{result.matched ? "MATCH" : "NO MATCH"} — {((result.confidence ?? 0) * 100).toFixed(1)}%</p>
-                <p className="text-xs text-zinc-500">threshold: {((result.threshold_used ?? 0) * 100).toFixed(0)}%</p>
-                <button onClick={retry} className="mt-3 w-full rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white">Test Again</button>
-              </div>
-            )}
-          </div>
-        )}
+        <div className="mt-4 flex flex-col items-center gap-2 text-center">
+          {(phase==="active"||phase==="countdown"||phase==="capturing") && (
+            <p className="text-sm text-zinc-400"><Camera className="mr-1 inline h-4 w-4"/>{isReady?statusMsg:"Loading..."}</p>
+          )}
+          {phase==="done" && result && (
+            <div className="w-full space-y-2">
+              <div className="flex items-center gap-2 rounded-full bg-green-600 px-4 py-1.5 text-sm font-medium text-white"><CheckCircle className="h-4 w-4"/>Scan complete</div>
+              {result.confidence != null && (
+                <p className="text-xs text-zinc-400">Match: {((result.confidence??0)*100).toFixed(1)}% (threshold {((result.threshold_used??0)*100).toFixed(0)}%)</p>
+              )}
+              {mode==="enroll" && userId && (
+                <>
+                  <code className="block break-all rounded bg-zinc-800 p-1.5 text-[10px] text-green-400">{userId}</code>
+                  <button onClick={()=>{setMode("verify");setUserId(userId);setPhase("idle");}} className="rounded-lg bg-blue-600 px-4 py-1.5 text-xs font-medium text-white">Switch to Verify</button>
+                </>
+              )}
+              <button onClick={retry} className="rounded-lg bg-zinc-800 px-4 py-1.5 text-xs text-zinc-300">Scan Again</button>
+            </div>
+          )}
+          {phase==="error" && (
+            <div className="flex flex-col items-center gap-3"><p className="text-sm text-red-400"><XCircle className="mr-1 inline h-4 w-4"/>{errMsg}</p><button onClick={retry} className="rounded-full bg-blue-600 px-6 py-2.5 text-sm text-white">Try Again</button></div>
+          )}
+        </div>
       </main>
     </div>
   );

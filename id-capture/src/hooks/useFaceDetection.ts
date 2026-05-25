@@ -1,68 +1,65 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
+import { useRef, useState, useEffect, useCallback } from "react";
+import { FaceLandmarker, FilesetResolver, type NormalizedLandmark } from "@mediapipe/tasks-vision";
 
-const MODEL_URL = "/models/face-api";
+// ── Face mesh region connections (canonical 468-point topology) ─
 
-let _faceapi: any = null;
-let _loaded = false;
-let _loading: Promise<void> | null = null;
+export const MESH_REGIONS = {
+  faceOval:   [10,338,297,332,284,251,389,356,454,323,361,288,397,365,379,378,400,377,152,148,176,149,150,136,172,58,132,93,234,127,162,21,54,103,67,109],
+  leftEye:    [33,246,161,160,159,158,157,173,133,155,154,153,145,144,163,7],
+  rightEye:   [362,398,384,385,386,387,388,466,263,249,390,373,374,380,381,382],
+  leftBrow:   [46,53,52,65,55,70,63,105,66,107],
+  rightBrow:  [276,283,282,295,285,300,293,334,296,336],
+  nose:       [6,168,197,195,5,4,1,19,94,2,98,327,460,294,455,459,458,461,354],
+  lipsOuter:  [61,146,91,181,84,17,314,405,321,375,291,409,270,269,267,0,37,39,40,185],
+  lipsInner:  [78,191,80,81,82,13,312,311,310,415,308,324,318,402,317,14,87,178,88,95],
+};
 
-async function getFaceApi(): Promise<any> {
-  if (_faceapi) return _faceapi;
-  _faceapi = await import("@vladmandic/face-api");
-  return _faceapi;
-}
+function ringEdges(idx: number[]): [number, number][] { const e: [number, number][] = []; for (let i=0; i<idx.length; i++) e.push([idx[i], idx[(i+1)%idx.length]]); return e; }
 
-async function ensureModels(): Promise<void> {
-  if (_loaded) return;
+export const REGION_EDGES: Record<string, { edges: [number,number][]; color: string }> = {
+  "Jawline":     { edges: ringEdges(MESH_REGIONS.faceOval), color: "#34d399" },
+  "Left Eye":    { edges: ringEdges(MESH_REGIONS.leftEye), color: "#38bdf8" },
+  "Right Eye":   { edges: ringEdges(MESH_REGIONS.rightEye), color: "#38bdf8" },
+  "Left Brow":   { edges: ringEdges(MESH_REGIONS.leftBrow), color: "#fbbf24" },
+  "Right Brow":  { edges: ringEdges(MESH_REGIONS.rightBrow), color: "#fbbf24" },
+  "Nose":        { edges: ringEdges(MESH_REGIONS.nose), color: "#a78bfa" },
+  "Lips":        { edges: [...ringEdges(MESH_REGIONS.lipsOuter), ...ringEdges(MESH_REGIONS.lipsInner)], color: "#f472b6" },
+};
+
+// ── Model loader ──────────────────────────────────────────────────
+
+let _landmarker: FaceLandmarker | null = null;
+let _loading: Promise<FaceLandmarker> | null = null;
+
+async function load(): Promise<FaceLandmarker> {
+  if (_landmarker) return _landmarker;
   if (!_loading) {
     _loading = (async () => {
-      const fa = await getFaceApi();
-      console.log("[face-api] Loading models...");
-      await fa.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
-      await fa.nets.faceLandmark68TinyNet.loadFromUri(MODEL_URL);
-      _loaded = true;
-      console.log("[face-api] Ready (bbox + 68-tiny landmarks)");
+      console.log("[MP] Loading FaceLandmarker...");
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm"
+      );
+      _landmarker = await FaceLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+          delegate: "GPU",
+        },
+        runningMode: "IMAGE", numFaces: 1, outputFaceBlendshapes: false,
+      });
+      console.log("[MP] FaceLandmarker ready");
+      return _landmarker;
     })();
   }
   return _loading;
 }
 
-export interface FaceBox {
-  x: number; y: number; width: number; height: number;
-}
+// ── Hook ──────────────────────────────────────────────────────────
 
-export type PoseState = "center" | "left" | "right" | "up" | "none";
-
-/** Detect head pose from nose tip position RELATIVE to the face bounding box.
- *
- *  face-api processes the RAW (un-mirrored) camera frame.
- *  In the raw image: person's LEFT  = right side of image
- *                    person's RIGHT = left side of image
- *
- *  When turning head LEFT:  nose appears on the RIGHT side of the face box
- *  When turning head RIGHT: nose appears on the LEFT side of the face box
- *  When looking UP:         nose appears HIGHER in the face box
- */
-function detectPose(box: FaceBox, noseTip: { x: number; y: number }): PoseState {
-  const boxCx = box.x + box.width / 2;
-  const boxCy = box.y + box.height / 2;
-  const bw = Math.max(box.width, 1);
-  const bh = Math.max(box.height, 1);
-
-  const noseOffX = (noseTip.x - boxCx) / bw;
-  const noseOffY = (noseTip.y - boxCy) / bh;
-
-  // Nose on right side of face box (in raw image) = turned LEFT
-  if (noseOffX > 0.05) return "left";
-  // Nose on left side of face box = turned RIGHT
-  if (noseOffX < -0.045) return "right";
-  // Nose above box center = looking UP
-  if (noseOffY < -0.04) return "up";
-  // Nose roughly centered
-  if (Math.abs(noseOffX) < 0.035 && Math.abs(noseOffY) < 0.035) return "center";
-  return "none";
+export interface DetectResult {
+  landmarks: NormalizedLandmark[][];
+  faceDetected: boolean;
 }
 
 export function useFaceDetection() {
@@ -72,54 +69,40 @@ export function useFaceDetection() {
   useEffect(() => {
     if (started.current) return;
     started.current = true;
-    ensureModels().then(() => setIsReady(true)).catch(e => console.error("[face-api] fail:", e));
+    load().then(() => setIsReady(true)).catch(e => console.error("[MP] fail:", e));
   }, []);
 
-  async function detect(video: HTMLVideoElement): Promise<{
-    box: FaceBox; pose: PoseState; noseTip: { x: number; y: number };
-  } | null> {
-    const fa = _faceapi;
-    if (!fa || !_loaded) return null;
+  const detect = useCallback((video: HTMLVideoElement, canvas: HTMLCanvasElement): DetectResult => {
+    const lm = _landmarker;
+    if (!lm) return { landmarks: [], faceDetected: false };
     const vw = video.videoWidth, vh = video.videoHeight;
-    if (!vw || !vh) return null;
+    if (!vw || !vh) return { landmarks: [], faceDetected: false };
+
+    canvas.width = vw; canvas.height = vh;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return { landmarks: [], faceDetected: false };
+    ctx.drawImage(video, 0, 0, vw, vh);
 
     try {
-      const result = await fa.detectSingleFace(
-        video,
-        new fa.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 })
-      ).withFaceLandmarks();  // uses faceLandmark68TinyNet
-
-      if (!result) {
-        (window as any).__pose = { pose: "none", reason: "no face detected" };
-        return null;
+      const res = lm.detect(canvas);
+      if (res.faceLandmarks?.length) {
+        const face = res.faceLandmarks[0];
+        const box = bboxFromLandmarks(face);
+        (window as any).__face = { detected: true, box, pts: face.length };
+        return { landmarks: res.faceLandmarks, faceDetected: true };
       }
-
-      const raw = result.box;
-      const box: FaceBox = { x: raw.x, y: raw.y, width: raw.width, height: raw.height };
-      const nose = result.landmarks.getNose();
-      const noseTip = { x: nose[3].x, y: nose[3].y };
-      const boxCx = box.x + box.width / 2;
-      const boxCy = box.y + box.height / 2;
-      const noseOffX = (noseTip.x - boxCx) / Math.max(box.width, 1);
-      const noseOffY = (noseTip.y - boxCy) / Math.max(box.height, 1);
-      const pose = detectPose(box, noseTip);
-
-      // Heavy debug logging
-      if (Math.random() < 0.02) {
-        console.log(
-          `[Pose] box=(${box.x.toFixed(0)},${box.y.toFixed(0)} ${box.width.toFixed(0)}x${box.height.toFixed(0)}) ` +
-          `nose=(${noseTip.x.toFixed(0)},${noseTip.y.toFixed(0)}) ` +
-          `offX=${noseOffX.toFixed(3)} offY=${noseOffY.toFixed(3)} → ${pose}`
-        );
-      }
-
-      (window as any).__pose = { pose, box, noseTip, noseOffX: noseOffX.toFixed(3), noseOffY: noseOffY.toFixed(3) };
-
-      return { box, pose, noseTip };
-    } catch {
-      return null;
-    }
-  }
+    } catch (e) { /* ignore */ }
+    (window as any).__face = { detected: false };
+    return { landmarks: [], faceDetected: false };
+  }, []);
 
   return { isReady, detect };
 }
+
+export function bboxFromLandmarks(pts: NormalizedLandmark[]) {
+  let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity;
+  for (const p of pts) { if (p.x<minX) minX=p.x; if (p.x>maxX) maxX=p.x; if (p.y<minY) minY=p.y; if (p.y>maxY) maxY=p.y; }
+  return { x: minX, y: minY, width: maxX-minX, height: maxY-minY };
+}
+
+export type { NormalizedLandmark };
