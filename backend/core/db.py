@@ -50,8 +50,6 @@ class ExtractionSession(Base):
     back_capture_id = Column(String, nullable=True)
     status = Column(String, default="pending")  # pending | processing | completed | failed
     merged_fields = Column(Text, nullable=True)  # JSON string
-    face_document_match = Column(Boolean, nullable=True)
-    face_document_similarity = Column(Float, nullable=True)
     error_reason = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
