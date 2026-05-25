@@ -12,7 +12,6 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from core.auth import get_current_user_or_api_key
 from core.db import Capture, KYCResult, SessionLocal, get_db
 from core.storage import upload_encrypted
-from models.quality_checker import check_quality
 from models.rcnn_validator import validate_capture
 
 logger = logging.getLogger(__name__)
@@ -54,19 +53,6 @@ async def submit_and_validate(
     if image is None:
         raise HTTPException(status_code=400, detail="Invalid image data")
 
-    # Quality gate
-    quality = check_quality(image)
-    if not quality["quality_passed"]:
-        return {
-            "validation_passed": False,
-            "model": "quality_checker",
-            "confidence": 0.0,
-            "card_type_detected": None,
-            "rejection_reason": "; ".join(quality["issues"]),
-            "capture_id": None,
-        }
-
-    # Faster R-CNN validation
     result = _sanitize(validate_capture(image, side=side))
 
     if not result["validation_passed"]:
