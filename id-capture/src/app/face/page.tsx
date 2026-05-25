@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { API_BASE } from "@/lib/apiBase";
 import { canvasToJpegBlob } from "@/lib/frameEncoder";
-import { useMediaPipeFace } from "@/hooks/useMediaPipeFace";
+import { useMediaPipeFace, getFaceTessellation } from "@/hooks/useMediaPipeFace";
 import { checkLiveness, prepareLivenessInput } from "@/lib/silentFaceLiveness";
 import Link from "next/link";
 import { ArrowLeft, Camera, Loader2, CheckCircle, XCircle, UserPlus, Fingerprint, ArrowUp, ArrowLeftCircle, ArrowRightCircle, Focus } from "lucide-react";
@@ -120,31 +120,21 @@ export default function FacePage() {
   }
 
   function detectAngle(): Angle | null {
-    // Use MediaPipe's built-in head pose from the transformation matrix
-    // Much more reliable than landmark-based heuristics
+    // Use MediaPipe's transformation matrix → Euler angles (already mirrored for front camera)
+    // After mirror correction in useMediaPipeFace:
+    //   yaw < 0  = turning head LEFT
+    //   yaw > 0  = turning head RIGHT
+    //   pitch < 0 = looking UP
     if (!headPose) return null;
 
     const { yaw, pitch } = headPose;
 
-    // Log every 30 frames for calibration
-    if (Math.random() < 0.03) {
-      console.log(`[Pose] yaw=${yaw.toFixed(1)}° pitch=${pitch.toFixed(1)}° roll=${headPose.roll.toFixed(1)}°`);
-    }
+    if (yaw < -18) return "left";
+    if (yaw > 18) return "right";
+    if (pitch < -10) return "up";
+    if (Math.abs(yaw) < 8 && Math.abs(pitch) < 6) return "center";
 
-    // Yaw: rotation around Y axis (horizontal head turn)
-    // Negative yaw = turning toward the person's LEFT
-    // Positive yaw = turning toward the person's RIGHT
-    if (yaw < -20) return "left";
-    if (yaw > 20) return "right";
-
-    // Pitch: rotation around X axis (vertical head tilt)
-    // Positive pitch = looking UP
-    if (pitch > 12) return "up";
-
-    // Center: small yaw and small pitch
-    if (Math.abs(yaw) < 10 && Math.abs(pitch) < 8) return "center";
-
-    return null; // transitioning between angles
+    return null;
   }
 
   // ── Frame loop ─────────────────────────────────────────────────
@@ -306,6 +296,16 @@ export default function FacePage() {
         const fd = new FormData();
         fd.append("image", bestFrame, "face.jpg");
         fd.append("liveness_score", String(livenessScore));
+
+        // Compute and send quality score
+        const quality = computeQuality();
+        fd.append("quality_score", String(quality));
+
+        // Send landmarks_3d for storage
+        if (scanLandmarks.length > 0) {
+          fd.append("landmarks_3d", JSON.stringify(scanLandmarks));
+        }
+
         const res = await fetch(`${API_BASE}/api/face/enroll`, { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: fd });
         if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `HTTP ${res.status}`);
         const data = await res.json();
@@ -328,6 +328,16 @@ export default function FacePage() {
     }
   }
 
+  function computeQuality(): number {
+    if (!headPose || !landmarks || !landmarks[0]) return 0.3;
+    const isCentered = Math.abs(headPose.yaw) < 10 && Math.abs(headPose.pitch) < 8;
+    const hasAll = landmarks[0].length >= 468;
+    const zVals = landmarks[0].map((p: any) => p.z);
+    const zSpread = Math.max(...zVals) - Math.min(...zVals);
+    const depthScore = Math.min(zSpread / 0.1, 1.0);
+    return isCentered && hasAll ? Math.round((0.6 + depthScore * 0.4) * 100) / 100 : 0.3;
+  }
+
   function retry() {
     stop();
     setPhase("idle");
@@ -337,38 +347,6 @@ export default function FacePage() {
 
   // ── Overlay ────────────────────────────────────────────────────
 
-  const TESSELATION: [number, number][] = (() => {
-    const c: [number, number][] = [];
-    const le = [33, 246, 161, 160, 159, 158, 157, 173, 133, 155, 154, 153, 145, 144, 163, 7];
-    for (let i = 0; i < le.length; i++) c.push([le[i], le[(i + 1) % le.length]]);
-    const re = [362, 398, 384, 385, 386, 387, 388, 466, 263, 249, 390, 373, 374, 380, 381, 382];
-    for (let i = 0; i < re.length; i++) c.push([re[i], re[(i + 1) % re.length]]);
-    const leb = [46, 53, 52, 65, 55, 70, 63, 105, 66, 107];
-    for (let i = 0; i < leb.length; i++) c.push([leb[i], leb[(i + 1) % leb.length]]);
-    const reb = [276, 283, 282, 295, 285, 300, 293, 334, 296, 336];
-    for (let i = 0; i < reb.length; i++) c.push([reb[i], reb[(i + 1) % reb.length]]);
-    const nose = [6, 168, 197, 195, 5, 4, 1, 19, 94, 2, 98, 327, 460, 294, 459, 458, 461, 354, 455, 460];
-    for (let i = 0; i < nose.length - 1; i++) c.push([nose[i], nose[i + 1]]);
-    c.push([1, 2], [2, 98], [98, 327]);
-    const lo = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185];
-    for (let i = 0; i < lo.length; i++) c.push([lo[i], lo[(i + 1) % lo.length]]);
-    const li = [78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95];
-    for (let i = 0; i < li.length; i++) c.push([li[i], li[(i + 1) % li.length]]);
-    const oval = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109];
-    for (let i = 0; i < oval.length; i++) c.push([oval[i], oval[(i + 1) % oval.length]]);
-    c.push([10, 151], [151, 9], [9, 8], [8, 168], [168, 6], [6, 197], [197, 195], [195, 5], [5, 4], [4, 1], [1, 19], [19, 94], [94, 2], [2, 200], [200, 199], [199, 175], [175, 152]);
-    c.push([107, 336], [105, 334], [66, 296], [70, 300], [55, 285], [65, 295], [52, 282], [53, 283], [46, 276]);
-    c.push([33, 46], [133, 53], [173, 52], [157, 65], [158, 55], [159, 70], [160, 63], [161, 105], [246, 107]);
-    c.push([362, 276], [263, 283], [249, 282], [390, 295], [373, 285], [374, 300], [380, 293], [381, 334], [382, 296], [398, 336]);
-    c.push([6, 33], [6, 362], [168, 133], [168, 263], [197, 157], [197, 390], [195, 158], [195, 373], [5, 159], [5, 374]);
-    c.push([2, 0], [2, 17], [200, 37], [200, 267], [17, 199], [37, 175], [267, 175]);
-    for (let i = 0; i < 16; i++) {
-      const top = [234, 127, 162, 21, 54, 103, 67, 109, 10, 338, 297, 332, 284, 251, 389, 356, 454][i];
-      const bot = [93, 132, 58, 172, 136, 150, 149, 176, 148, 152, 377, 400, 378, 379, 365, 397, 288][i] || 152;
-      if (top && bot) c.push([top, bot]);
-    }
-    return c;
-  })();
 
   function drawOverlay(video: HTMLVideoElement, detected: boolean) {
     const canvas = overlayRef.current;
@@ -387,7 +365,7 @@ export default function FacePage() {
     ctx.strokeStyle = color;
     ctx.lineWidth = 0.7;
     ctx.beginPath();
-    for (const [a, b] of TESSELATION) {
+    for (const [a, b] of getFaceTessellation()) {
       const pa = pts[a], pb = pts[b];
       if (!pa || !pb) continue;
       ctx.moveTo(pa.x * w, pa.y * h);
@@ -526,7 +504,7 @@ export default function FacePage() {
           <div className="mt-4 w-full rounded-xl bg-zinc-900 p-4">
             <h2 className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">3D Face Scan</h2>
             <p className="mb-1 text-xs text-zinc-600">Drag to rotate — scroll to zoom</p>
-            <Face3DViewer landmarks={scanLandmarks} tessellation={TESSELATION} width={368} height={350} />
+            <Face3DViewer landmarks={scanLandmarks} width={368} height={400} />
           </div>
         )}
 
