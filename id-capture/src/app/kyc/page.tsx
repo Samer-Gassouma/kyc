@@ -35,6 +35,7 @@ interface VerificationResult {
   passed: boolean;
   confidence: number;
   user_id: string;
+  liveBlob?: Blob;
 }
 
 type Phase =
@@ -53,9 +54,11 @@ export default function KYCPage() {
   const [userId, setUserId] = useState<string>("");
   const [verificationResult, setVerificationResult] =
     useState<VerificationResult | null>(null);
+  const [docMatch, setDocMatch] = useState<{match:boolean;similarity:number}|null>(null);
   const [error, setError] = useState<string | null>(null);
   const frontBlobRef = useRef<Blob | null>(null);
   const backBlobRef = useRef<Blob | null>(null);
+  const cinFaceBlobRef = useRef<Blob | null>(null);
 
   // Get JWT on mount
   useEffect(() => {
@@ -134,6 +137,7 @@ export default function KYCPage() {
               );
               if (faceCropRes.ok) {
                 const faceBlob = await faceCropRes.blob();
+                cinFaceBlobRef.current = faceBlob; // save for cross-check
                 const enrollForm = new FormData();
                 enrollForm.append("image", faceBlob, "cin_face.jpg");
                 const enrollRes = await fetch(`${API_BASE}/api/face/enroll`, {
@@ -171,18 +175,40 @@ export default function KYCPage() {
     [token]
   );
 
-  // ── Step 3: Face scan done → verification result received ──────────
+  // ── Step 3: Face scan done → cross-check against CIN document ──────
   const handleFaceScanComplete = useCallback(
-    (result: VerificationResult) => {
+    async (result: VerificationResult) => {
       if (!result.passed) {
         setPhase("failed");
         setError("Face verification did not pass");
         return;
       }
       setVerificationResult(result);
+
+      // Cross-check: live face vs CIN document photo
+      const cinBlob = cinFaceBlobRef.current;
+      const liveBlob = result.liveBlob;
+      if (cinBlob && liveBlob) {
+        try {
+          const crossForm = new FormData();
+          crossForm.append("document_image", cinBlob, "cin.jpg");
+          crossForm.append("live_image", liveBlob, "live.jpg");
+
+          const crossRes = await fetch(`${API_BASE}/api/face/verify-against-document`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${token}` },
+            body: crossForm,
+          });
+
+          if (crossRes.ok) {
+            setDocMatch(await crossRes.json());
+          }
+        } catch { /* non-fatal */ }
+      }
+
       setPhase("completed");
     },
-    []
+    [token]
   );
 
   // ── Step helpers ───────────────────────────────────────────────────
@@ -288,6 +314,19 @@ export default function KYCPage() {
               <CheckCircle className="h-4 w-4" />
               Verification complete
             </div>
+
+            {/* Document face match */}
+            {docMatch && (
+              <div className={`rounded-xl p-4 ${docMatch.match ? "bg-green-500/10 ring-1 ring-green-500/30" : "bg-red-500/10 ring-1 ring-red-500/30"}`}>
+                <h2 className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">ID Document Match</h2>
+                <div className="flex items-center gap-2">
+                  {docMatch.match ? <CheckCircle className="h-5 w-5 text-green-400" /> : <XCircle className="h-5 w-5 text-red-400" />}
+                  <span className={`text-sm font-medium ${docMatch.match ? "text-green-400" : "text-red-400"}`}>
+                    {docMatch.match ? "ID Photo Matched" : "ID Photo Mismatch"} — {(docMatch.similarity*100).toFixed(0)}%
+                  </span>
+                </div>
+              </div>
+            )}
 
             {/* Face verification result */}
             {verificationResult && (

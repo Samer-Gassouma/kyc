@@ -145,6 +145,43 @@ async def verify(
     }
 
 
+@router.post("/verify-against-document")
+async def verify_against_document(
+    live_image: UploadFile = File(...),
+    document_image: UploadFile = File(...),
+    _user: dict = Depends(get_current_user_or_api_key),
+) -> dict[str, Any]:
+    """Compare a live face scan against the CIN document photo using InsightFace."""
+    live_bytes = await live_image.read()
+    doc_bytes = await document_image.read()
+
+    live_np = cv2.imdecode(np.frombuffer(live_bytes, np.uint8), cv2.IMREAD_COLOR)
+    doc_np = cv2.imdecode(np.frombuffer(doc_bytes, np.uint8), cv2.IMREAD_COLOR)
+
+    if live_np is None or doc_np is None:
+        raise HTTPException(400, "Invalid image data")
+
+    loop = asyncio.get_event_loop()
+    encoder = get_face_encoder()
+
+    live_result = await loop.run_in_executor(None, encoder.encode, live_np)
+    doc_result = await loop.run_in_executor(None, encoder.encode, doc_np)
+
+    if live_result is None or doc_result is None:
+        raise HTTPException(400, "No face detected in one or both images")
+
+    live_emb, _ = live_result
+    doc_emb, _ = doc_result
+
+    similarity = float(np.dot(live_emb, doc_emb))
+
+    return {
+        "match": similarity >= settings.face_match_threshold,
+        "similarity": round(similarity, 4),
+        "threshold_used": settings.face_match_threshold,
+    }
+
+
 @router.get("/profile/{user_id}")
 async def get_profile(
     user_id: str,

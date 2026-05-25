@@ -6,7 +6,7 @@ import { API_BASE } from "@/lib/apiBase";
 import { useFaceDetection, REGION_EDGES } from "@/hooks/useFaceDetection";
 import { CheckCircle, Loader2, XCircle, Camera } from "lucide-react";
 
-interface FaceScanStepProps { token: string; userId: string; onComplete: (r: { passed: boolean; confidence: number; user_id: string }) => void; }
+interface FaceScanStepProps { token: string; userId: string; onComplete: (r: { passed: boolean; confidence: number; user_id: string; liveBlob?: Blob }) => void; }
 type State = "idle"|"preparing"|"scanning"|"verifying"|"passed"|"failed";
 
 export default function FaceScanStep({ token, userId, onComplete }: FaceScanStepProps) {
@@ -83,7 +83,7 @@ export default function FaceScanStep({ token, userId, onComplete }: FaceScanStep
       const res=await fetch(`${API_BASE}/api/face/verify`,{method:"POST",headers:{Authorization:`Bearer ${token}`},body:fd});
       if(!res.ok) throw new Error((await res.json().catch(()=>({}))).detail||`HTTP ${res.status}`);
       const d=await res.json(); setConfidence(d.confidence);
-      if(d.matched){setState("passed");onC.current({passed:true,confidence:d.confidence,user_id:d.user_id});}
+      if(d.matched){setState("passed");onC.current({passed:true,confidence:d.confidence,user_id:d.user_id,liveBlob:blob});}
       else{setState("failed");setError(`No match (${(d.confidence*100).toFixed(0)}%)`);}
     } catch(e) { setState("failed"); setError(e instanceof Error?e.message:"Verification failed"); }
   }
