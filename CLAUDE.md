@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Real-time Tunisian CIN (national ID card) capture and verification system. Frontend is a Next.js 16 camera app with in-browser MediaPipe FaceMesh + Silent-Face liveness. Backend is FastAPI with YOLO, SAM, InsightFace ArcFace, EasyOCR, and Celery for async ML processing. Face embeddings stored in PostgreSQL + pgvector.
+Real-time Tunisian CIN (national ID card) capture and verification system. Frontend is a Next.js 16 camera app with in-browser MediaPipe FaceMesh + blink-based liveness. Backend is FastAPI with YOLO, SAM, InsightFace ArcFace, EasyOCR, and Celery for async ML processing. Face embeddings stored in PostgreSQL + pgvector.
 
 ## Commands
 
@@ -22,9 +22,6 @@ PYTHONPATH=/home/ivan/kyc/backend celery -A celery_worker worker --loglevel=info
 
 # Download model weights (~600 MB, one-time)
 python scripts/setup_models.py
-
-# Download face pipeline models
-python scripts/setup_face_models.py
 ```
 
 ### Frontend (Next.js 16)
@@ -45,67 +42,102 @@ docker-compose up --build   # spins up PostgreSQL, Redis, MinIO, backend, Celery
 ## Architecture
 
 ```
-Browser (Next.js)           FastAPI Backend            PostgreSQL + pgvector
-├─ MediaPipe FaceMesh       ├─ InsightFace ArcFace     └─ face_profiles (vector(512))
-├─ Silent-Face Liveness     ├─ YOLO + SAM              
-└─ ONNX quality classifier  ├─ EasyOCR + ROI           
-                             ├─ Redis ── Celery Worker  
-                             └─ S3/MinIO (encrypted)    
+Browser (Next.js)              FastAPI Backend            PostgreSQL + pgvector
+├─ MediaPipe FaceLandmarker    ├─ InsightFace ArcFace     └─ face_profiles (vector(512))
+├─ Blink liveness (blendshapes)├─ YOLO + SAM              
+├─ 3D face mesh (Three.js)     ├─ EasyOCR + ROI           
+└─ Static card guide            ├─ Redis ── Celery Worker  
+                                └─ S3/MinIO (encrypted)    
 ```
+
+## KYC Flow
+
+```
+front_id → back_id → face_scan → extraction (background) → completed
+```
+
+1. **Card capture**: Static guide frame overlay. User aligns card, taps Capture. Preview → Retake or Use this photo. No auto-detection. No quality rejection — all images accepted.
+2. **Face scan**: MediaPipe FaceLandmarker detects face, draws colored mesh overlay (eyes=blue, nose=purple, lips=pink, brows=yellow, jaw=green). Auto-captures after 2s hold. Blink detection via `eyeBlinkLeft`/`eyeBlinkRight` blendshapes for liveness. 3D face mesh displayed after capture (Three.js, OrbitControls, auto-rotate).
+3. **Extraction**: Started as fire-and-forget after face scan passes. Runs YOLO → perspective correction → EasyOCR → ROI extraction in Celery worker. User gets session ID immediately, can check results later on `/extract` page.
+
+## Face Pipeline
+
+| Layer | Technology | Role |
+|---|---|---|
+| Face detection | **MediaPipe FaceLandmarker** | 468 3D landmarks + blendshapes |
+| Liveness | **Blink detection** via blendshapes | eyeBlinkLeft/Right > 0.35 → open→close→open cycle |
+| Identity embedding | **InsightFace ArcFace** (buffalo_l) | 512-d face vector, server-side |
+| Vector storage | **PostgreSQL + pgvector** | Cosine similarity, ivfflat index |
+| Match threshold | **0.35** (configurable: `FACE_MATCH_THRESHOLD`) | Calibrated on CFP dataset |
+| 3D viewer | **Three.js** with OrbitControls | Colored mesh, auto-rotate |
 
 ### Backend (`backend/`)
 
 - **`main.py`** — FastAPI app, mounts all routers, preloads ML models on startup
-- **`core/config.py`** — Pydantic Settings from `.env` (all config via environment variables)
+- **`core/config.py`** — Pydantic Settings from `.env`. Key: `FACE_MATCH_THRESHOLD=0.35`, `pg_database_url`
 - **`core/db.py`** — SQLAlchemy models (SQLite): `Capture`, `KYCResult`, `ExtractionSession`
-- **`core/pg_db.py`** — Async SQLAlchemy + pgvector models (PostgreSQL): `User`, `FaceProfile` with ivfflat cosine index
-- **`core/auth.py`** — Dual auth: API key (`X-API-Key` header) with JWT fallback (`Authorization: Bearer` or `?token=` query param)
+- **`core/pg_db.py`** — Async SQLAlchemy + pgvector (PostgreSQL): `User`, `FaceProfile` with ivfflat cosine index
+- **`core/auth.py`** — Dual auth: API key + JWT fallback
 - **`core/storage.py`** — S3-compatible storage with AES-256-GCM encryption
-- **`celery_worker.py`** — Celery app + task definitions (`tasks.ocr`)
-- **`routers/stream.py`** — WebSocket `/ws/stream`: receives JPEG frames, returns YOLO + SAM geometry (SAM runs every 5th frame for perf)
-- **`routers/capture.py`** — REST: submit/validate captures, poll OCR status, serve face crops
-- **`routers/extract.py`** — REST: start async extraction (front+back), poll status with Redis Pub/Sub or DB polling fallback
-- **`routers/face.py`** — REST: POST `/api/face/enroll` (InsightFace embedding + pgvector store), POST `/api/face/verify` (cosine similarity ≥ 0.35), GET `/api/face/profile/{user_id}`
-- **`routers/gallery.py`** — Upload endpoint with auto-detection, crop, rectify, validate
-- **`routers/auth.py`** — JWT token issuance for frontend test sessions
-- **`models/yolo_detector.py`** — YOLOv8 + contour-based document detection (hybrid: YOLO → contour refinement → pure contour fallback)
-- **`models/geometry.py`** — SAM ViT-B segmentation → mask-to-quad → geometric measurements (angle, skew, coverage) → perspective correction. Fallback chain: SAM → classical contours → bbox corners
-- **`models/face.py`** — InsightFace ArcFace (`buffalo_l`) encoder: face detection, alignment, 512-d embedding generation
-- **`models/roi_extractor.py`** — Region-of-interest field extraction for Tunisian CIN: predefined ROI boxes (relative coordinates) → adaptive preprocessing per field → parallel EasyOCR via ThreadPoolExecutor → Arabic text parsing (dates, names, CIN validation). Includes barcode decoding (pyzbar)
-- **`models/quality_checker.py`** — Laplacian blur check, glare detection, brightness analysis
-- **`models/rcnn_validator.py`** — Faster R-CNN (COCO pretrained) for document presence validation with quality checks
-- **`models/card_rectifier.py`** — Multi-method rotation estimation (FFT + projection + Hough, consensus voting) with before/after validation
-- **`models/ocr_cleaner.py`** — mT5/AraT5-based OCR post-processing for Arabic fields with regex fallback
-- **`tasks/ocr_task.py`** — Celery task handler: runs ROI extraction on corrected card, persists results, publishes Redis Pub/Sub notification
-- **`scripts/setup_models.py`** — Downloads model weights (YOLO, R-CNN, SAM, ONNX quality classifier)
-- **`scripts/setup_face_models.py`** — Downloads Silent-Face ONNX model for client-side liveness; InsightFace auto-downloads on first use
+- **`celery_worker.py`** — Celery app + task `tasks.ocr`
+- **`routers/stream.py`** — WebSocket `/ws/stream`: YOLO + SAM geometry for real-time card detection
+- **`routers/capture.py`** — POST `/api/capture/validate` — **all images accepted unconditionally** (validation bypassed)
+- **`routers/extract.py`** — POST `/api/extract/start` — async front+back processing, **no quality checks**. Poll status at `/api/extract/status/{id}`
+- **`routers/face.py`** — POST `/api/face/enroll`, POST `/api/face/verify`, POST `/api/face/verify-against-document`, GET `/api/face/profile/{user_id}`
+- **`routers/gallery.py`** — Upload endpoint with auto-detection
+- **`routers/auth.py`** — JWT token issuance
+- **`models/yolo_detector.py`** — YOLOv8 document detection
+- **`models/geometry.py`** — SAM ViT-B segmentation → perspective correction
+- **`models/face.py`** — InsightFace ArcFace encoder (512-d embeddings)
+- **`models/roi_extractor.py`** — ROI field extraction for Tunisian CIN (EasyOCR, Arabic parsing, barcode)
+- **`models/quality_checker.py`** — Quality checks (bypassed in production — not called)
+- **`models/rcnn_validator.py`** — **Passthrough** — always returns `validation_passed: True`
+- **`models/card_rectifier.py`** — Rotation estimation
+- **`models/ocr_cleaner.py`** — mT5/AraT5 OCR post-processing
+- **`tasks/ocr_task.py`** — Celery task: ROI extraction, persist results, Redis Pub/Sub notification
+- **`scripts/setup_models.py`** — Downloads YOLO, R-CNN, SAM, ONNX quality classifier weights
+- **`scripts/setup_face_models.py`** — InsightFace auto-download; Silent-Face ONNX conversion (legacy)
+- **`scripts/test_face_pipeline.py`** — CFP dataset integration tests for face pipeline
+- **`tests/test_face_api.py`** — API integration tests for enroll/verify/profile endpoints
 
 ### Frontend (`id-capture/`)
 
 - **Next.js 16** with App Router, TypeScript, Tailwind CSS 4
-- Pages: `/` (home), `/kyc` (full KYC flow), `/extract` (CIN data extraction)
-- **`components/kyc/`** — Camera overlay, capture review, ID capture step, face scan step (MediaPipe + Silent-Face), quality indicator, step progress
-- **`hooks/`** — `useAutoCapture`, `useCamera`, `useCaptureStatus`, `useIDWebSocket`, `useONNXQuality`, `useMediaPipeFace`
-- **`lib/`** — API base URL, frame encoder, ONNX model loader, Silent-Face liveness wrapper
-- **Key dependency**: Next.js 16 has breaking changes — when writing frontend code, consult `id-capture/node_modules/next/dist/docs/` for the current API
+- Pages: `/` (home), `/kyc` (full KYC flow), `/face` (standalone face test), `/extract` (CIN extraction)
+- **`components/kyc/`**
+  - `IDCaptureStep.tsx` — Manual capture with static guide frame, preview/confirm, no quality rejection
+  - `Face3DViewer.tsx` — Three.js 3D face mesh viewer (colored regions, OrbitControls, auto-rotate)
+  - `StepProgress.tsx` — 3-step progress indicator (Front ID, Back ID, Face Scan)
+  - `FaceScanStep.tsx` — Standalone face scan component (legacy, mostly replaced by inline logic in KYC page)
+- **`hooks/`**
+  - `useFaceDetection.ts` — MediaPipe FaceLandmarker, region edges, triangle indices, face crop utility
+  - `useCardDetection.ts` — Brightness-based card detection (legacy, not used in current flow)
+  - `useCamera.ts` — Generic camera hook
+  - `useAutoCapture.ts`, `useCaptureStatus.ts`, `useIDWebSocket.ts`, `useONNXQuality.ts` — Legacy utilities
+- **`lib/`** — API base URL, frame encoder
 - API calls proxy to backend via Next.js rewrites (`/api/*` → `http://localhost:8000/api/*`)
 
 ### Key ML Pipeline
 
-1. **Document detection**: YOLOv8 finds card → SAM segments pixel mask → contour extracts 4 corners → perspective warp to 856×540 flat card
-2. **OCR**: Predefined ROI boxes cropped → adaptive preprocessing (CLAHE, upscaling, Arabic-aware dilation) → parallel EasyOCR (Arabic + English) → field-specific parsing (Arabic name extraction, date parsing with fuzzy month matching)
-3. **Face enrollment**: CIN face photo extracted from front card → auto-enrolled via InsightFace ArcFace → 512-d embedding stored in PostgreSQL pgvector
-4. **Liveness + Verification**: MediaPipe FaceMesh extracts 468 3D landmarks client-side → Silent-Face Anti-Spoofing checks liveness in-browser → verified frame sent to server → InsightFace ArcFace generates 512-d embedding → pgvector cosine similarity query (threshold ≥ 0.35) → match result returned
+1. **Document detection**: YOLOv8 finds card → SAM segments → perspective warp to 856×540 flat card
+2. **OCR**: ROI boxes cropped → EasyOCR (Arabic + English) → field-specific parsing
+3. **Face detection (client)**: MediaPipe FaceLandmarker → 468 3D landmarks + blendshapes (blink detection)
+4. **Face enrollment (server)**: InsightFace ArcFace → 512-d embedding → pgvector storage
+5. **Face verification**: Cosine similarity query via pgvector (threshold 0.35)
 
 ### Data Flow
 
-Images are encrypted (AES-256-GCM) before S3 upload. S3 keys are stored in the `captures` table. OCR results stored as JSON in `kyc_results`. Celery workers notify completion via Redis Pub/Sub on `kyc:capture:{id}:done` channel. The `/api/extract/start` endpoint fires both sides in parallel, waits for both workers (Redis Pub/Sub with DB polling fallback), then merges front+back fields.
+Images are encrypted (AES-256-GCM) before S3 upload. S3 keys stored in `captures` table. OCR results stored as JSON in `kyc_results`. Celery workers notify completion via Redis Pub/Sub on `kyc:capture:{id}:done` channel.
 
 ### Notes
 
-- Model weights in `backend/weights/` are gitignored — run `scripts/setup_models.py` to download
-- Face models: run `scripts/setup_face_models.py` for Silent-Face ONNX; InsightFace auto-downloads buffalo_l on first use
-- `backend/.env` is gitignored — copy from `.env.example`
-- PostgreSQL with pgvector is required for face identity storage; SQLite remains for KYC operational data
-- Redis is used as both Celery broker and Pub/Sub channel for cross-process communication
-- SAM is expensive — in the WebSocket stream it only runs every 5th frame; the gallery/capture routers run it every time
+- Model weights in `backend/weights/` are gitignored — run `scripts/setup_models.py`
+- InsightFace auto-downloads `buffalo_l` on first use (~275 MB)
+- PostgreSQL with pgvector required for face identity; SQLite for KYC operational data
+- **All image quality checks are bypassed** — `rcnn_validator.py` returns passthrough, `extract.py` has no quality gates
+- Redis is Celery broker + Pub/Sub channel
+- SAM expensive — WebSocket stream runs every 5th frame; capture/extract routers run it every time
+- Face match threshold calibrated to 0.35 based on CFP dataset (99% TPR, 0% FPR at 100 identities)
+- `face_profiles.landmarks_3d` stores 468-point 3D landmark arrays as JSONB
+- No Silent-Face ONNX required — liveness is blink-based via MediaPipe blendshapes
+- `/face` is a standalone testing page; `/kyc` is the production KYC flow
