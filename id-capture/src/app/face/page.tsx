@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { API_BASE } from "@/lib/apiBase";
 import { canvasToJpegBlob } from "@/lib/frameEncoder";
-import { useFaceDetection, REGION_EDGES, cropFaceFromVideo, buildTriangleIndices } from "@/hooks/useFaceDetection";
+import { useFaceDetection, REGION_EDGES } from "@/hooks/useFaceDetection";
 import Link from "next/link";
 import { ArrowLeft, Camera, Loader2, CheckCircle, XCircle, UserPlus, Fingerprint } from "lucide-react";
 import Face3DViewer from "@/components/kyc/Face3DViewer";
@@ -20,8 +20,6 @@ export default function FacePage() {
   const [result, setResult] = useState<any>(null);
   const [countdown, setCountdown] = useState(0);
   const [scanPoints, setScanPoints] = useState<{x:number,y:number,z:number}[]>([]);
-  const [faceTexture, setFaceTexture] = useState(""); // cropped face data URL
-  const [faceCropMeta, setFaceCropMeta] = useState<any>(null); // crop box for UV remapping
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
@@ -113,19 +111,8 @@ export default function FacePage() {
 
   async function handleCapture(video: HTMLVideoElement, pts: any[]) {
     setPhase("capturing"); setStatusMsg("Capturing...");
-
-    // Compute face bounding box from landmarks
-    let bx=Infinity,by=Infinity,bX=-Infinity,bY=-Infinity;
-    for (const p of pts) { if(p.x<bx)bx=p.x; if(p.x>bX)bX=p.x; if(p.y<by)by=p.y; if(p.y>bY)bY=p.y; }
-    const box = { x: bx*video.videoWidth, y: by*video.videoHeight, width: (bX-bx)*video.videoWidth, height: (bY-by)*video.videoHeight };
-
-    // Crop face for texture
-    const cropJson = JSON.parse(cropFaceFromVideo(video, box));
-    setFaceTexture(cropJson.url);
-    setFaceCropMeta({ sx: cropJson.sx, sy: cropJson.sy, sw: cropJson.sw, sh: cropJson.sh, vw: cropJson.vw, vh: cropJson.vh });
     setScanPoints(pts.map((p:any)=>({x:p.x,y:p.y,z:p.z})));
 
-    // Grab full frame for backend
     const c = document.createElement("canvas");
     c.width=video.videoWidth; c.height=video.videoHeight;
     c.getContext("2d")!.drawImage(video,0,0);
@@ -235,7 +222,7 @@ export default function FacePage() {
             </div>
           )}
           {phase==="done" && scanPoints.length>0 && (
-            <Face3DViewer points={scanPoints.map(p=>[p.x,p.y,p.z])} faceTexture={faceTexture} cropMeta={faceCropMeta} width={368} height={460}/>
+            <Face3DViewer points={scanPoints.map(p=>[p.x,p.y,p.z])} width={368} height={460}/>
           )}
         </div>
 
