@@ -6,24 +6,50 @@ import { canvasToJpegBlob } from "@/lib/frameEncoder";
 import { useMediaPipeFace } from "@/hooks/useMediaPipeFace";
 import { checkLiveness, prepareLivenessInput } from "@/lib/silentFaceLiveness";
 import Link from "next/link";
-import { ArrowLeft, Camera, Loader2, CheckCircle, XCircle, UserPlus, Fingerprint } from "lucide-react";
+import { ArrowLeft, Camera, Loader2, CheckCircle, XCircle, UserPlus, Fingerprint, ArrowUp, ArrowLeftCircle, ArrowRightCircle, Focus } from "lucide-react";
 
 type Mode = "enroll" | "verify";
+type Angle = "center" | "left" | "right" | "up";
+
+const ANGLE_ORDER: Angle[] = ["center", "left", "right", "up"];
+
+const ANGLE_LABEL: Record<Angle, string> = {
+  center: "Look straight ahead",
+  left: "Turn your head to the left",
+  right: "Turn your head to the right",
+  up: "Tilt your head upward",
+};
+
+const ANGLE_ICON: Record<Angle, typeof Focus> = {
+  center: Focus,
+  left: ArrowLeftCircle,
+  right: ArrowRightCircle,
+  up: ArrowUp,
+};
 
 export default function FacePage() {
   const [mode, setMode] = useState<Mode>("enroll");
   const [token, setToken] = useState("");
-  const [phase, setPhase] = useState<"idle" | "active" | "verifying" | "done" | "error">("idle");
+  const [phase, setPhase] = useState<"idle" | "active" | "capturing" | "verifying" | "done" | "error">("idle");
   const [statusMsg, setStatusMsg] = useState("");
   const [errMsg, setErrMsg] = useState<string | null>(null);
   const [userId, setUserId] = useState("");
   const [result, setResult] = useState<{ matched?: boolean; confidence?: number; threshold_used?: number; user_id?: string } | null>(null);
+
+  // Multi-angle capture state
+  const [currentAngle, setCurrentAngle] = useState<Angle>("center");
+  const [angleProgress, setAngleProgress] = useState(0); // 0-100 per angle
+  const [completedAngles, setCompletedAngles] = useState<Set<Angle>>(new Set());
+  const [meshVisible, setMeshVisible] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const animRef = useRef<number>(0);
   const detectCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const angleStableRef = useRef(0);
+  const capturedFrames = useRef<Map<Angle, Blob>>(new Map());
+  const captureInProgress = useRef(false);
 
   const { landmarks, faceDetected, isReady, detect } = useMediaPipeFace();
 
@@ -33,7 +59,7 @@ export default function FacePage() {
       .then(r => r.json()).then(d => setToken(d.access_token)).catch(() => setToken("dev_token"));
   }, []);
 
-  // ── Start / Stop camera ────────────────────────────────────────
+  // ── Camera ─────────────────────────────────────────────────────
 
   const stop = useCallback(() => {
     cancelAnimationFrame(animRef.current);
@@ -42,40 +68,86 @@ export default function FacePage() {
   }, []);
 
   const start = useCallback(async () => {
-    setErrMsg(null);
-    setResult(null);
-    setPhase("active");
-    setStatusMsg("Loading...");
+    setErrMsg(null); setResult(null); setPhase("active");
+    setCurrentAngle("center"); setAngleProgress(0);
+    setCompletedAngles(new Set()); setMeshVisible(false);
+    capturedFrames.current.clear();
+    captureInProgress.current = false;
+    angleStableRef.current = 0;
+    setStatusMsg("Position your face in the frame");
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
-        audio: false,
+        video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } }, audio: false,
       });
       streamRef.current = stream;
       const v = videoRef.current;
-      if (!v) throw new Error("no video element");
+      if (!v) throw new Error("no video");
       v.srcObject = stream;
       await v.play();
-      setStatusMsg(mode === "enroll" ? "Position your face" : "Position your face");
     } catch (e) {
       setErrMsg(e instanceof Error ? e.message : "Camera error");
       setPhase("error");
     }
-  }, [mode]);
+  }, []);
 
   useEffect(() => stop, []); // eslint-disable-line
 
-  // ── Frame loop ─────────────────────────────────────────────────
+  // ── Pose detection helpers ─────────────────────────────────────
 
-  const stableRef = useRef(0);     // 0–30 progress
-  const captureRef = useRef(false);
-  const [progress, setProgress] = useState(0);
+  function isStableFace(): boolean {
+    if (!landmarks || !landmarks[0] || landmarks[0].length < 468) return false;
+    const pts = landmarks[0];
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const p of pts) {
+      if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+      if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+    }
+    const area = (maxX - minX) * (maxY - minY);
+    const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+    return area > 0.05 && Math.sqrt((cx - 0.5) ** 2 + (cy - 0.5) ** 2) < 0.35;
+  }
+
+  function detectAngle(): Angle | null {
+    if (!landmarks || !landmarks[0]) return null;
+    const pts = landmarks[0];
+    const nose = pts[1];        // nose tip
+    const chin = pts[152];      // chin
+    const forehead = pts[10];   // forehead
+    const leftCheek = pts[234]; // left cheek
+    const rightCheek = pts[454]; // right cheek
+    const leftEye = pts[33];    // left eye outer
+    const rightEye = pts[263];  // right eye outer
+
+    if (!nose || !chin || !forehead || !leftCheek || !rightCheek) return null;
+
+    const faceCenterX = (leftCheek.x + rightCheek.x) / 2;
+    const faceWidth = Math.abs(rightCheek.x - leftCheek.x);
+    const noseOffsetX = (nose.x - faceCenterX) / faceWidth;
+
+    // Yaw detection: nose horizontal offset from face center
+    if (noseOffsetX < -0.15) return "left";
+    if (noseOffsetX > 0.15) return "right";
+
+    // Pitch detection: nose vertical relative to eye-chin range
+    const faceHeight = Math.abs(chin.y - forehead.y);
+    const eyeY = (leftEye.y + rightEye.y) / 2;
+    const noseRelY = (nose.y - eyeY) / faceHeight;
+    if (noseRelY > 0.35) return "up";
+
+    // Center
+    if (Math.abs(noseOffsetX) < 0.08) return "center";
+
+    return null; // between angles — transitioning
+  }
+
+  // ── Frame loop ─────────────────────────────────────────────────
 
   useEffect(() => {
     if (phase !== "active") {
-      stableRef.current = 0;
-      captureRef.current = false;
-      setProgress(0);
+      setMeshVisible(false);
+      angleStableRef.current = 0;
+      setAngleProgress(0);
       return;
     }
     if (!detectCanvasRef.current) detectCanvasRef.current = document.createElement("canvas");
@@ -88,216 +160,143 @@ export default function FacePage() {
         return;
       }
 
-      detect(video, dCanvas);
-      drawOverlay(video);
+      const detected = detect(video, dCanvas);
 
-      if (!captureRef.current) {
-        if (faceIsWellPositioned()) {
-          stableRef.current = Math.min(30, stableRef.current + 1);
-        } else {
-          stableRef.current = Math.max(0, stableRef.current - 2);
+      if (detected && isStableFace()) {
+        setMeshVisible(true);
+        const currentPose = detectAngle();
+
+        if (currentPose && !completedAngles.has(currentPose) && !captureInProgress.current) {
+          if (currentPose === currentAngle) {
+            // User is in the correct pose
+            angleStableRef.current = Math.min(30, angleStableRef.current + 1);
+            setAngleProgress(Math.round((angleStableRef.current / 30) * 100));
+            setStatusMsg(`${ANGLE_LABEL[currentAngle]} — hold still`);
+
+            if (angleStableRef.current >= 30 && !captureInProgress.current) {
+              captureInProgress.current = true;
+              captureCurrentAngle();
+            }
+          } else if (currentAngle === "center" && currentPose === "left" && completedAngles.has("center")) {
+            // Already got center, now detecting left — update current angle
+            // Don't force it, let the angle detection drive
+          }
         }
-        const pct = Math.round((stableRef.current / 30) * 100);
-        setProgress(pct);
 
-        if (stableRef.current >= 30) {
-          captureRef.current = true;
-          setStatusMsg("Processing...");
-          handleAction();
-          return;
-        } else if (stableRef.current > 15) {
-          setStatusMsg("Hold still...");
-        } else if (landmarks) {
-          setStatusMsg("Center your face in the frame");
-        } else {
-          setStatusMsg(mode === "enroll" ? "Position your face" : "Position your face");
+        if (!currentPose || currentPose !== currentAngle) {
+          // Slowly decay stability if not in correct pose
+          angleStableRef.current = Math.max(0, angleStableRef.current - 2);
+          setAngleProgress(Math.round((angleStableRef.current / 30) * 100));
+          if (angleStableRef.current < 5) {
+            setStatusMsg(ANGLE_LABEL[currentAngle]);
+          }
+        }
+      } else {
+        setMeshVisible(false);
+        angleStableRef.current = Math.max(0, angleStableRef.current - 3);
+        setAngleProgress(Math.round((angleStableRef.current / 30) * 100));
+        if (!detected) {
+          setStatusMsg("Position your face in the frame");
         }
       }
 
+      drawOverlay(video, detected);
       animRef.current = requestAnimationFrame(loop);
     };
 
     animRef.current = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(animRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase, landmarks]);
+  }, [phase, landmarks, currentAngle, completedAngles]);
 
-  // ── Face position check ────────────────────────────────────────
+  // ── Capture current angle ──────────────────────────────────────
 
-  function faceIsWellPositioned(): boolean {
-    if (!landmarks || !landmarks[0] || landmarks[0].length < 468) return false;
-    const pts = landmarks[0];
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const p of pts) {
-      if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
-      if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
-    }
-    const area = (maxX - minX) * (maxY - minY);
-    const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
-    return area > 0.06 && Math.sqrt((cx - 0.5) ** 2 + (cy - 0.5) ** 2) < 0.3;
-  }
-
-  // ── Face mesh — professional KYC wireframe overlay ─────────────
-
-  // Full dense triangle mesh (tessellation) of the 468-point face topology.
-  // Each connection is [pt_a, pt_b] — an edge in the wireframe.
-  // Generated from MediaPipe's canonical face mesh UV topology.
-  const TESSELATION: [number, number][] = (() => {
-    const c: [number, number][] = [];
-    // Left eye region
-    const le = [33, 246, 161, 160, 159, 158, 157, 173, 133, 155, 154, 153, 145, 144, 163, 7];
-    for (let i = 0; i < le.length; i++) c.push([le[i], le[(i + 1) % le.length]]);
-    // Right eye region
-    const re = [362, 398, 384, 385, 386, 387, 388, 466, 263, 249, 390, 373, 374, 380, 381, 382];
-    for (let i = 0; i < re.length; i++) c.push([re[i], re[(i + 1) % re.length]]);
-    // Left eyebrow
-    const leb = [46, 53, 52, 65, 55, 70, 63, 105, 66, 107];
-    for (let i = 0; i < leb.length; i++) c.push([leb[i], leb[(i + 1) % leb.length]]);
-    // Right eyebrow
-    const reb = [276, 283, 282, 295, 285, 300, 293, 334, 296, 336];
-    for (let i = 0; i < reb.length; i++) c.push([reb[i], reb[(i + 1) % reb.length]]);
-    // Nose bridge + tip
-    const nose = [6, 168, 197, 195, 5, 4, 1, 19, 94, 2, 98, 327, 460, 294, 459, 458, 461, 354, 455, 460];
-    for (let i = 0; i < nose.length - 1; i++) c.push([nose[i], nose[i + 1]]);
-    c.push([1, 2], [2, 98], [98, 327]);
-    // Lips outer
-    const lo = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185];
-    for (let i = 0; i < lo.length; i++) c.push([lo[i], lo[(i + 1) % lo.length]]);
-    // Lips inner
-    const li = [78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95];
-    for (let i = 0; i < li.length; i++) c.push([li[i], li[(i + 1) % li.length]]);
-    // Face oval
-    const oval = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109];
-    for (let i = 0; i < oval.length; i++) c.push([oval[i], oval[(i + 1) % oval.length]]);
-    // Dense horizontal+vertical grid across the face for KYC wireframe look
-    // Cheeks and jaw connectors
-    const cheeks = [
-      234, 93, 132, 58, 172, 136, 150, 149, 176, 148, 152, 377, 400, 378, 379, 365, 397, 288, 361, 323, 454
-    ];
-    for (let i = 0; i < cheeks.length; i++) c.push([cheeks[i], cheeks[(i + 1) % cheeks.length]]);
-    // Forehead connectors
-    const forehead = [109, 67, 103, 54, 21, 162, 127, 234];
-    for (let i = 0; i < forehead.length; i++) c.push([forehead[i], 10]);
-    // Vertical connectors: forehead → nose → chin
-    c.push([10, 151], [151, 9], [9, 8], [8, 168], [168, 6], [6, 197], [197, 195], [195, 5], [5, 4], [4, 1], [1, 19], [19, 94], [94, 2], [2, 200], [200, 199], [199, 175], [175, 152]);
-    // Horizontal brow-to-brow
-    c.push([107, 336], [105, 334], [66, 296], [70, 300], [55, 285], [65, 295], [52, 282], [53, 283], [46, 276]);
-    // Eye-to-brow connectors
-    c.push([33, 46], [133, 53], [173, 52], [157, 65], [158, 55], [159, 70], [160, 63], [161, 105], [246, 107]);
-    c.push([362, 276], [263, 283], [249, 282], [390, 295], [373, 285], [374, 300], [380, 293], [381, 334], [382, 296], [398, 336]);
-    // Nose-to-eye connectors
-    c.push([6, 33], [6, 362], [168, 133], [168, 263], [197, 157], [197, 390], [195, 158], [195, 373], [5, 159], [5, 374]);
-    // Nose-to-lips
-    c.push([2, 0], [2, 17], [200, 37], [200, 267]);
-    // Lips-to-chin
-    c.push([17, 199], [37, 175], [267, 175]);
-    // Jaw-to-cheek dense grid
-    for (let i = 0; i < 16; i++) {
-      const top = [234, 127, 162, 21, 54, 103, 67, 109, 10, 338, 297, 332, 284, 251, 389, 356, 454][i];
-      const bot = [93, 132, 58, 172, 136, 150, 149, 176, 148, 152, 377, 400, 378, 379, 365, 397, 288][i] || 152;
-      if (top && bot) c.push([top, bot]);
-    }
-    // Eye region dense fill
-    for (const [a, b] of [[33,133],[133,155],[155,145],[145,159],[159,163],[246,161],[161,144],[144,153],[153,154],[154,157],[157,173],[173,158],[158,160],[160,7],[7,163]] as [number,number][]) c.push([a,b]);
-    for (const [a, b] of [[362,263],[263,249],[249,390],[390,373],[373,380],[398,381],[381,374],[374,384],[384,385],[385,386],[386,387],[387,388],[388,466],[466,382]] as [number,number][]) c.push([a,b]);
-    return c;
-  })();
-
-  // Point indices to draw as subtle dots (key junction points)
-  const KEY_POINTS = new Set([
-    ...Array.from({length: 468}, (_, i) => i).filter(i =>
-      i < 200 || i > 350 || [0,17,61,291,152,10,109,67,103,54,21,162,127,234,93,132,58,172,136,150,149,176,148,377,400,378,379,365,397,288,361,323,454,338,297,332,284,251,389,356].includes(i)
-    )
-  ]);
-
-  function drawOverlay(video: HTMLVideoElement) {
-    const canvas = overlayRef.current;
-    if (!canvas || !video) return;
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    if (!landmarks || !landmarks[0]) return;
-
-    const pts = landmarks[0];
-    const w = canvas.width, h = canvas.height;
-    const positioned = faceIsWellPositioned();
-    const color = positioned ? "rgba(56, 189, 248, 0.7)" : "rgba(56, 189, 248, 0.25)";
-    const dotColor = positioned ? "rgba(56, 189, 248, 0.9)" : "rgba(56, 189, 248, 0.3)";
-
-    // Draw all tessellation edges as thin semi-transparent lines
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 0.8;
-    ctx.beginPath();
-    for (const [a, b] of TESSELATION) {
-      const pa = pts[a], pb = pts[b];
-      if (!pa || !pb) continue;
-      ctx.moveTo(pa.x * w, pa.y * h);
-      ctx.lineTo(pb.x * w, pb.y * h);
-    }
-    ctx.stroke();
-
-    // Draw junction points as subtle dots
-    ctx.fillStyle = dotColor;
-    for (let i = 0; i < 468; i++) {
-      const p = pts[i];
-      if (!p) continue;
-      // Denser dots on key features, sparser elsewhere
-      const isKey = KEY_POINTS.has(i);
-      const r = isKey ? 1.2 : 0.6;
-      ctx.beginPath();
-      ctx.arc(p.x * w, p.y * h, r, 0, Math.PI * 2);
-      ctx.fill();
-    }
-  }
-
-  // ── Enroll or Verify ───────────────────────────────────────────
-
-  async function handleAction() {
-    setPhase("verifying");
-    setStatusMsg("Checking liveness...");
+  async function captureCurrentAngle() {
+    setPhase("capturing");
+    setStatusMsg("Capturing...");
 
     const video = videoRef.current;
-    if (!video || !landmarks || !landmarks[0]) { setPhase("error"); setErrMsg("Lost face"); return; }
-
-    const pts = landmarks[0];
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const p of pts) {
-      if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
-      if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
-    }
-    const bbox = { x: minX * video.videoWidth, y: minY * video.videoHeight, width: (maxX - minX) * video.videoWidth, height: (maxY - minY) * video.videoHeight };
-
-    let bestLive = 0, bestBlob: Blob | null = null;
-    for (let i = 0; i < 3; i++) {
-      await new Promise(r => setTimeout(r, 150));
-      const input = prepareLivenessInput(video, bbox);
-      if (!input) continue;
-      const score = await checkLiveness(input);
-      if (score > bestLive) {
-        bestLive = score;
-        const fc = document.createElement("canvas");
-        fc.width = video.videoWidth; fc.height = video.videoHeight;
-        fc.getContext("2d")!.drawImage(video, 0, 0);
-        bestBlob = await canvasToJpegBlob(fc, 0.85);
-      }
-    }
-
-    if (!bestBlob || bestLive < 0.5) {
-      setPhase("error");
-      setErrMsg(bestLive < 0.5 ? "Spoof detected — use a real face" : "Liveness failed");
+    const current = currentAngle;
+    if (!video || !landmarks || !landmarks[0]) {
+      captureInProgress.current = false;
+      setPhase("active");
       return;
     }
 
-    setStatusMsg(mode === "enroll" ? "Generating embedding..." : "Verifying...");
+    // Grab best frame
+    const fc = document.createElement("canvas");
+    fc.width = video.videoWidth;
+    fc.height = video.videoHeight;
+    fc.getContext("2d")!.drawImage(video, 0, 0);
+    const blob = await canvasToJpegBlob(fc, 0.85);
+    capturedFrames.current.set(current, blob);
+
+    // Mark this angle done
+    const newCompleted = new Set(completedAngles);
+    newCompleted.add(current);
+    setCompletedAngles(newCompleted);
+    captureInProgress.current = false;
+    angleStableRef.current = 0;
+    setAngleProgress(0);
+
+    // Move to next angle or finish
+    const currentIdx = ANGLE_ORDER.indexOf(current);
+    if (currentIdx < ANGLE_ORDER.length - 1) {
+      const nextAngle = ANGLE_ORDER[currentIdx + 1];
+      setCurrentAngle(nextAngle);
+      setStatusMsg(ANGLE_LABEL[nextAngle]);
+      setPhase("active");
+    } else {
+      // All angles captured — verify
+      setPhase("verifying");
+      setStatusMsg("Processing...");
+      await runVerification();
+    }
+  }
+
+  // ── Verification / Enrollment ──────────────────────────────────
+
+  async function runVerification() {
+    // Pick best frame (center, or any available)
+    const bestFrame = capturedFrames.current.get("center") ||
+      capturedFrames.current.get("left") ||
+      capturedFrames.current.get("right") ||
+      capturedFrames.current.get("up");
+
+    if (!bestFrame) {
+      setPhase("error");
+      setErrMsg("No frames captured");
+      return;
+    }
+
+    // Run liveness on best frame
+    const video = videoRef.current;
+    let livenessScore = 0.95; // default if we can't compute
+    if (video && landmarks && landmarks[0]) {
+      const pts = landmarks[0];
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const p of pts) {
+        if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+        if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+      }
+      const bbox = { x: minX * video.videoWidth, y: minY * video.videoHeight, width: (maxX - minX) * video.videoWidth, height: (maxY - minY) * video.videoHeight };
+      const input = prepareLivenessInput(video, bbox);
+      if (input) livenessScore = await checkLiveness(input);
+    }
+
+    if (livenessScore < 0.5) {
+      setPhase("error");
+      setErrMsg("Spoof detected — use a real face, not a photo or screen");
+      return;
+    }
+
     try {
       if (mode === "enroll") {
         const fd = new FormData();
-        fd.append("image", bestBlob, "face.jpg");
-        fd.append("liveness_score", String(bestLive));
+        fd.append("image", bestFrame, "face.jpg");
+        fd.append("liveness_score", String(livenessScore));
         const res = await fetch(`${API_BASE}/api/face/enroll`, { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: fd });
-        if (!res.ok) throw new Error((await res.json().catch(()=>({}))).detail || `HTTP ${res.status}`);
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `HTTP ${res.status}`);
         const data = await res.json();
         setUserId(data.user_id);
         setResult(data);
@@ -305,10 +304,10 @@ export default function FacePage() {
       } else {
         if (!userId) { setPhase("error"); setErrMsg("Enroll first or paste a user ID above"); return; }
         const fd = new FormData();
-        fd.append("image", bestBlob, "face.jpg");
+        fd.append("image", bestFrame, "face.jpg");
         fd.append("user_id", userId);
         const res = await fetch(`${API_BASE}/api/face/verify`, { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: fd });
-        if (!res.ok) throw new Error((await res.json().catch(()=>({}))).detail || `HTTP ${res.status}`);
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `HTTP ${res.status}`);
         setResult(await res.json());
         setPhase("done");
       }
@@ -324,6 +323,83 @@ export default function FacePage() {
     setErrMsg(null);
     setResult(null);
   }
+
+  // ── Overlay ────────────────────────────────────────────────────
+
+  const TESSELATION: [number, number][] = (() => {
+    const c: [number, number][] = [];
+    const le = [33, 246, 161, 160, 159, 158, 157, 173, 133, 155, 154, 153, 145, 144, 163, 7];
+    for (let i = 0; i < le.length; i++) c.push([le[i], le[(i + 1) % le.length]]);
+    const re = [362, 398, 384, 385, 386, 387, 388, 466, 263, 249, 390, 373, 374, 380, 381, 382];
+    for (let i = 0; i < re.length; i++) c.push([re[i], re[(i + 1) % re.length]]);
+    const leb = [46, 53, 52, 65, 55, 70, 63, 105, 66, 107];
+    for (let i = 0; i < leb.length; i++) c.push([leb[i], leb[(i + 1) % leb.length]]);
+    const reb = [276, 283, 282, 295, 285, 300, 293, 334, 296, 336];
+    for (let i = 0; i < reb.length; i++) c.push([reb[i], reb[(i + 1) % reb.length]]);
+    const nose = [6, 168, 197, 195, 5, 4, 1, 19, 94, 2, 98, 327, 460, 294, 459, 458, 461, 354, 455, 460];
+    for (let i = 0; i < nose.length - 1; i++) c.push([nose[i], nose[i + 1]]);
+    c.push([1, 2], [2, 98], [98, 327]);
+    const lo = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185];
+    for (let i = 0; i < lo.length; i++) c.push([lo[i], lo[(i + 1) % lo.length]]);
+    const li = [78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95];
+    for (let i = 0; i < li.length; i++) c.push([li[i], li[(i + 1) % li.length]]);
+    const oval = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109];
+    for (let i = 0; i < oval.length; i++) c.push([oval[i], oval[(i + 1) % oval.length]]);
+    c.push([10, 151], [151, 9], [9, 8], [8, 168], [168, 6], [6, 197], [197, 195], [195, 5], [5, 4], [4, 1], [1, 19], [19, 94], [94, 2], [2, 200], [200, 199], [199, 175], [175, 152]);
+    c.push([107, 336], [105, 334], [66, 296], [70, 300], [55, 285], [65, 295], [52, 282], [53, 283], [46, 276]);
+    c.push([33, 46], [133, 53], [173, 52], [157, 65], [158, 55], [159, 70], [160, 63], [161, 105], [246, 107]);
+    c.push([362, 276], [263, 283], [249, 282], [390, 295], [373, 285], [374, 300], [380, 293], [381, 334], [382, 296], [398, 336]);
+    c.push([6, 33], [6, 362], [168, 133], [168, 263], [197, 157], [197, 390], [195, 158], [195, 373], [5, 159], [5, 374]);
+    c.push([2, 0], [2, 17], [200, 37], [200, 267], [17, 199], [37, 175], [267, 175]);
+    for (let i = 0; i < 16; i++) {
+      const top = [234, 127, 162, 21, 54, 103, 67, 109, 10, 338, 297, 332, 284, 251, 389, 356, 454][i];
+      const bot = [93, 132, 58, 172, 136, 150, 149, 176, 148, 152, 377, 400, 378, 379, 365, 397, 288][i] || 152;
+      if (top && bot) c.push([top, bot]);
+    }
+    return c;
+  })();
+
+  function drawOverlay(video: HTMLVideoElement, detected: boolean) {
+    const canvas = overlayRef.current;
+    if (!canvas || !video) return;
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (!meshVisible || !landmarks || !landmarks[0]) return;
+
+    const pts = landmarks[0];
+    const w = canvas.width, h = canvas.height;
+    const color = "rgba(56, 189, 248, 0.55)";
+
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 0.7;
+    ctx.beginPath();
+    for (const [a, b] of TESSELATION) {
+      const pa = pts[a], pb = pts[b];
+      if (!pa || !pb) continue;
+      ctx.moveTo(pa.x * w, pa.y * h);
+      ctx.lineTo(pb.x * w, pb.y * h);
+    }
+    ctx.stroke();
+
+    // Small dots at every 4th landmark for subtle density
+    ctx.fillStyle = "rgba(56, 189, 248, 0.7)";
+    for (let i = 0; i < 468; i += 2) {
+      const p = pts[i];
+      if (!p) continue;
+      ctx.beginPath();
+      ctx.arc(p.x * w, p.y * h, 0.8, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // ── Angle progress dots ────────────────────────────────────────
+
+  const totalAngles = ANGLE_ORDER.length;
+
+  const IconComponent = ANGLE_ICON[currentAngle];
 
   return (
     <div className="flex min-h-screen flex-col bg-zinc-950 text-zinc-100">
@@ -349,7 +425,7 @@ export default function FacePage() {
         {/* Idle */}
         {phase === "idle" && (
           <div className="flex flex-1 flex-col items-center justify-center gap-4">
-            <p className="text-sm text-zinc-400">{mode === "enroll" ? "Capture a face to enroll a new identity" : "Verify against an enrolled identity"}</p>
+            <p className="text-sm text-zinc-400">{mode === "enroll" ? "Capture your face from multiple angles to enroll" : "Verify against an enrolled identity"}</p>
             <button onClick={start} className="flex items-center gap-2 rounded-xl bg-blue-600 px-6 py-3 text-sm font-medium text-white hover:bg-blue-500">
               <Camera className="h-5 w-5" />Start Camera
             </button>
@@ -363,15 +439,16 @@ export default function FacePage() {
 
         {/* Camera */}
         <div className="relative w-full overflow-hidden rounded-2xl bg-black" style={{ maxWidth: 400 }}>
-          {phase === "active" && (
+          {(phase === "active" || phase === "capturing") && (
             <div className="relative">
               <video ref={videoRef} autoPlay playsInline muted className="h-full w-full object-cover" style={{ aspectRatio: "3/4", transform: "scaleX(-1)" }} />
               <canvas ref={overlayRef} className="pointer-events-none absolute inset-0 h-full w-full" style={{ transform: "scaleX(-1)" }} />
             </div>
           )}
           {phase === "verifying" && (
-            <div className="flex items-center justify-center bg-black" style={{ aspectRatio: "3/4" }}>
+            <div className="flex flex-col items-center justify-center bg-black gap-3" style={{ aspectRatio: "3/4" }}>
               <Loader2 className="h-10 w-10 animate-spin text-blue-400" />
+              <p className="text-sm text-zinc-300">{statusMsg}</p>
             </div>
           )}
           {phase === "done" && (
@@ -381,22 +458,50 @@ export default function FacePage() {
           )}
         </div>
 
-        {/* Status / Error */}
-        <div className="mt-4 text-center">
-          {phase === "active" && (
-            <div className="flex flex-col items-center gap-2">
-              <p className="text-sm text-zinc-400"><Camera className="mr-1 inline h-4 w-4" />{isReady ? statusMsg : "Loading face detection..."}</p>
-              {progress > 0 && (
-                <div className="h-1.5 w-48 overflow-hidden rounded-full bg-zinc-700">
-                  <div
-                    className="h-full rounded-full bg-blue-400 transition-all duration-200"
-                    style={{ width: `${progress}%` }}
-                  />
+        {/* Status */}
+        <div className="mt-4 flex flex-col items-center gap-2 text-center w-full">
+          {/* Multi-angle progress dots */}
+          {(phase === "active" || phase === "capturing") && (
+            <div className="flex items-center gap-2 mb-2">
+              {ANGLE_ORDER.map((a, i) => (
+                <div key={a} className="flex items-center gap-2">
+                  <div className={`flex h-8 w-8 items-center justify-center rounded-full text-xs font-bold transition-all ${
+                    completedAngles.has(a) ? "bg-green-500 text-white" :
+                    a === currentAngle ? "bg-blue-600 text-white ring-2 ring-blue-400" :
+                    "bg-zinc-700 text-zinc-400"
+                  }`}>
+                    {completedAngles.has(a) ? <CheckCircle className="h-4 w-4" /> : i + 1}
+                  </div>
+                  {i < totalAngles - 1 && <div className="h-0.5 w-6 bg-zinc-700" />}
                 </div>
-              )}
+              ))}
             </div>
           )}
-          {phase === "verifying" && <p className="text-sm text-blue-400"><Loader2 className="mr-1 inline h-4 w-4 animate-spin" />{statusMsg}</p>}
+
+          {/* Progress bar for current angle */}
+          {(phase === "active" || phase === "capturing") && angleProgress > 0 && (
+            <div className="h-1.5 w-48 overflow-hidden rounded-full bg-zinc-700">
+              <div className="h-full rounded-full bg-sky-400 transition-all duration-200" style={{ width: `${angleProgress}%` }} />
+            </div>
+          )}
+
+          {phase === "active" && (
+            <div className="flex items-center gap-2 text-sm text-zinc-400">
+              {isReady ? (
+                <>
+                  <IconComponent className="h-4 w-4 text-sky-400" />
+                  {meshVisible ? statusMsg : "Position your face in the frame"}
+                </>
+              ) : "Loading face detection..."}
+            </div>
+          )}
+
+          {phase === "capturing" && (
+            <p className="text-sm text-sky-400"><Loader2 className="mr-1 inline h-4 w-4 animate-spin" />{statusMsg}</p>
+          )}
+          {phase === "verifying" && (
+            <p className="text-sm text-blue-400"><Loader2 className="mr-1 inline h-4 w-4 animate-spin" />{statusMsg}</p>
+          )}
           {phase === "error" && (
             <div className="flex flex-col items-center gap-3">
               <p className="text-sm text-red-400"><XCircle className="mr-1 inline h-4 w-4" />{errMsg}</p>
