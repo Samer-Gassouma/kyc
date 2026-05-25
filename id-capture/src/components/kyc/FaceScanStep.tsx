@@ -203,7 +203,7 @@ export default function FaceScanStep({
       }
 
       grabFrame(video, canvas);
-      processFrame(video);
+      processFrame(video, canvas);
       drawOverlay();
 
       animRef.current = requestAnimationFrame(loop);

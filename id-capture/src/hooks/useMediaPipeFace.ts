@@ -1,27 +1,33 @@
 "use client";
 
 import { useRef, useState, useCallback, useEffect } from "react";
-import { FaceLandmarker, FilesetResolver, type NormalizedLandmark } from "@mediapipe/tasks-vision";
+import {
+  FaceLandmarker,
+  FilesetResolver,
+  type NormalizedLandmark,
+} from "@mediapipe/tasks-vision";
 
 interface UseMediaPipeFaceReturn {
   landmarks: NormalizedLandmark[][] | null;
   faceDetected: boolean;
   isReady: boolean;
   error: string | null;
-  processFrame: (video: HTMLVideoElement) => void;
+  processFrame: (video: HTMLVideoElement, canvas: HTMLCanvasElement) => void;
 }
 
 let faceLandmarker: FaceLandmarker | null = null;
-let initPromise: Promise<void> | null = null;
+let initPromise: Promise<FaceLandmarker> | null = null;
 
 async function ensureLandmarker(): Promise<FaceLandmarker> {
   if (faceLandmarker) return faceLandmarker;
 
   if (!initPromise) {
-    initPromise = (async () => {
+    initPromise = (async (): Promise<FaceLandmarker> => {
+      console.log("[MediaPipe] Loading WASM files...");
       const vision = await FilesetResolver.forVisionTasks(
         "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm"
       );
+      console.log("[MediaPipe] WASM loaded, creating FaceLandmarker...");
       faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
         baseOptions: {
           modelAssetPath:
@@ -29,14 +35,16 @@ async function ensureLandmarker(): Promise<FaceLandmarker> {
           delegate: "GPU",
         },
         outputFaceBlendshapes: false,
-        runningMode: "VIDEO",
+        outputFacialTransformationMatrixes: false,
+        runningMode: "IMAGE",
         numFaces: 1,
       });
+      console.log("[MediaPipe] FaceLandmarker ready");
+      return faceLandmarker;
     })();
   }
 
-  await initPromise;
-  return faceLandmarker!;
+  return initPromise;
 }
 
 export function useMediaPipeFace(): UseMediaPipeFaceReturn {
@@ -44,62 +52,55 @@ export function useMediaPipeFace(): UseMediaPipeFaceReturn {
   const [faceDetected, setFaceDetected] = useState(false);
   const [landmarks, setLandmarks] = useState<NormalizedLandmark[][] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const lastTimestampRef = useRef(0);
+  const loadAttempted = useRef(false);
 
   useEffect(() => {
+    if (loadAttempted.current) return;
+    loadAttempted.current = true;
+
     ensureLandmarker()
-      .then(() => {
-        setIsReady(true);
-      })
+      .then(() => setIsReady(true))
       .catch((e) => {
+        console.error("[MediaPipe] Load failed:", e);
         setError(e instanceof Error ? e.message : "MediaPipe failed to load");
       });
-
-    return () => {
-      // Keep the singleton loaded across unmounts
-    };
   }, []);
 
-  const processFrame = useCallback((video: HTMLVideoElement) => {
-    if (!faceLandmarker) return;
+  const processFrame = useCallback(
+    (video: HTMLVideoElement, canvas: HTMLCanvasElement) => {
+      if (!faceLandmarker) return;
 
-    const now = performance.now();
-    const timestamp = Math.floor(now);
-    // Skip duplicate timestamps
-    if (timestamp <= lastTimestampRef.current) {
-      lastTimestampRef.current = timestamp + 1;
-    } else {
-      lastTimestampRef.current = timestamp;
-    }
-
-    try {
-      const results = faceLandmarker.detectForVideo(video, lastTimestampRef.current);
-      if (results.faceLandmarks && results.faceLandmarks.length > 0) {
-        setLandmarks(results.faceLandmarks);
-        setFaceDetected(true);
-      } else {
+      try {
+        // Use IMAGE mode — pass the canvas directly to detect()
+        const results = faceLandmarker.detect(canvas);
+        if (results.faceLandmarks && results.faceLandmarks.length > 0) {
+          setLandmarks(results.faceLandmarks);
+          setFaceDetected(true);
+        } else {
+          setFaceDetected(false);
+        }
+      } catch (e) {
+        console.error("[MediaPipe] detect error:", e);
         setFaceDetected(false);
       }
-    } catch {
-      setFaceDetected(false);
-    }
-  }, []);
+    },
+    []
+  );
 
   return { landmarks, faceDetected, isReady, error, processFrame };
 }
 
-/** Minimum confidence a landmark must have to be considered valid. */
 export const MIN_LANDMARK_CONFIDENCE = 0.5;
 
-/** Validate that landmark array has all 468 points with sufficient confidence. */
 export function validateLandmarks(lm: NormalizedLandmark[][]): boolean {
   if (!lm || lm.length === 0) return false;
   const points = lm[0];
   if (points.length !== 468) return false;
-  return points.every((p) => p.visibility == null || p.visibility >= MIN_LANDMARK_CONFIDENCE);
+  return points.every(
+    (p) => p.visibility == null || p.visibility >= MIN_LANDMARK_CONFIDENCE
+  );
 }
 
-/** Serialize 468 landmarks to a plain array for JSON storage. */
 export function serializeLandmarks(lm: NormalizedLandmark[][]): number[][] {
   return lm[0].map((p) => [p.x, p.y, p.z]);
 }
