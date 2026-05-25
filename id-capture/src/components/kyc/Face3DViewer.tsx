@@ -21,7 +21,19 @@ export default function Face3DViewer({
 
   useEffect(() => {
     const mount = mountRef.current;
-    if (!mount || landmarks.length < 100) return;
+    if (!mount) return;
+    if (!landmarks || landmarks.length < 100) {
+      // Show placeholder while waiting
+      if (mount.children.length === 0) {
+        const p = document.createElement("p");
+        p.className = "text-xs text-zinc-500 text-center pt-20";
+        p.textContent = "No face data yet — complete the scan first";
+        mount.appendChild(p);
+      }
+      return;
+    }
+    // Clear placeholder
+    mount.innerHTML = "";
 
     // ── Scene setup ──────────────────────────────────────────────
     const scene = new THREE.Scene();

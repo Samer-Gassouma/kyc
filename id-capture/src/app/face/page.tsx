@@ -52,8 +52,16 @@ export default function FacePage() {
   const angleStableRef = useRef(0);
   const capturedFrames = useRef<Map<Angle, Blob>>(new Map());
   const captureInProgress = useRef(false);
+  const landmarkSaveCounter = useRef(0);
 
-  const { landmarks, faceDetected, isReady, detect } = useMediaPipeFace();
+  const { landmarks, faceDetected, headPose, isReady, detect } = useMediaPipeFace();
+
+  // Log head pose for calibration
+  useEffect(() => {
+    if (headPose && faceDetected) {
+      (window as any).__headPose = headPose;
+    }
+  }, [headPose, faceDetected]);
 
   // JWT
   useEffect(() => {
@@ -112,41 +120,31 @@ export default function FacePage() {
   }
 
   function detectAngle(): Angle | null {
-    if (!landmarks || !landmarks[0]) return null;
-    const pts = landmarks[0];
-    const nose = pts[1];        // nose tip
-    const chin = pts[152];      // chin
-    const forehead = pts[10];   // forehead
-    const leftCheek = pts[234]; // left cheek
-    const rightCheek = pts[454]; // right cheek
-    const leftEye = pts[33];    // left eye outer
-    const rightEye = pts[263];  // right eye outer
+    // Use MediaPipe's built-in head pose from the transformation matrix
+    // Much more reliable than landmark-based heuristics
+    if (!headPose) return null;
 
-    if (!nose || !chin || !forehead || !leftCheek || !rightCheek) return null;
+    const { yaw, pitch } = headPose;
 
-    const faceCenterX = (leftCheek.x + rightCheek.x) / 2;
-    const faceWidth = Math.abs(rightCheek.x - leftCheek.x);
-    const noseOffsetX = (nose.x - faceCenterX) / faceWidth;
+    // Log every 30 frames for calibration
+    if (Math.random() < 0.03) {
+      console.log(`[Pose] yaw=${yaw.toFixed(1)}° pitch=${pitch.toFixed(1)}° roll=${headPose.roll.toFixed(1)}°`);
+    }
 
-    // Yaw detection: nose horizontal offset from face center
-    // In the un-mirrored camera image, the person's LEFT side appears on
-    // the RIGHT of the frame. So noseOffsetX > 0 means nose is on the
-    // right side of the image = person turned their head LEFT.
-    if (noseOffsetX > 0.12) return "left";
-    if (noseOffsetX < -0.12) return "right";
+    // Yaw: rotation around Y axis (horizontal head turn)
+    // Negative yaw = turning toward the person's LEFT
+    // Positive yaw = turning toward the person's RIGHT
+    if (yaw < -20) return "left";
+    if (yaw > 20) return "right";
 
-    // Pitch detection: in image coords, y=0 is top.
-    // When looking UP, nose tip is HIGHER in the image (smaller y).
-    // noseRelY = (nose.y - eyeY) / faceHeight < 0 means nose above eyes = looking UP
-    const faceHeight = Math.abs(chin.y - forehead.y);
-    const eyeY = (leftEye.y + rightEye.y) / 2;
-    const noseRelY = (nose.y - eyeY) / Math.max(faceHeight, 0.01);
-    if (noseRelY < -0.08) return "up";
+    // Pitch: rotation around X axis (vertical head tilt)
+    // Positive pitch = looking UP
+    if (pitch > 12) return "up";
 
-    // Center: nose roughly centered horizontally and not looking up
-    if (Math.abs(noseOffsetX) < 0.08 && noseRelY > -0.05) return "center";
+    // Center: small yaw and small pitch
+    if (Math.abs(yaw) < 10 && Math.abs(pitch) < 8) return "center";
 
-    return null; // between angles — transitioning
+    return null; // transitioning between angles
   }
 
   // ── Frame loop ─────────────────────────────────────────────────
@@ -172,6 +170,11 @@ export default function FacePage() {
 
       if (detected && isStableFace()) {
         setMeshVisible(true);
+        // Continuously save landmarks for 3D viewer (throttled)
+        landmarkSaveCounter.current++;
+        if (landmarks && landmarks[0] && landmarkSaveCounter.current % 15 === 0) {
+          setScanLandmarks(landmarks[0].map((p: any) => [p.x, p.y, p.z]));
+        }
         const currentPose = detectAngle();
 
         if (currentPose && !completedAngles.has(currentPose) && !captureInProgress.current) {
@@ -255,10 +258,7 @@ export default function FacePage() {
       setStatusMsg(ANGLE_LABEL[nextAngle]);
       setPhase("active");
     } else {
-      // All angles captured — save landmarks for 3D view, then verify
-      if (landmarks && landmarks[0]) {
-        setScanLandmarks(landmarks[0].map((p: any) => [p.x, p.y, p.z]));
-      }
+      // All angles captured — verify
       setPhase("verifying");
       setStatusMsg("Processing...");
       await runVerification();
@@ -521,17 +521,18 @@ export default function FacePage() {
           )}
         </div>
 
+        {/* 3D Face Scan — show during active and after done */}
+        {(phase === "active" || phase === "done") && scanLandmarks.length > 0 && (
+          <div className="mt-4 w-full rounded-xl bg-zinc-900 p-4">
+            <h2 className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">3D Face Scan</h2>
+            <p className="mb-1 text-xs text-zinc-600">Drag to rotate — scroll to zoom</p>
+            <Face3DViewer landmarks={scanLandmarks} tessellation={TESSELATION} width={368} height={350} />
+          </div>
+        )}
+
         {/* Results */}
         {phase === "done" && result && (
           <div className="mt-4 w-full space-y-3">
-            {/* 3D Face Scan */}
-            {scanLandmarks.length > 0 && (
-              <div className="rounded-xl bg-zinc-900 p-4">
-                <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-zinc-500">3D Face Scan</h2>
-                <p className="mb-2 text-xs text-zinc-600">Drag to rotate — scroll to zoom</p>
-                <Face3DViewer landmarks={scanLandmarks} tessellation={TESSELATION} width={368} height={400} />
-              </div>
-            )}
             {mode === "enroll" && (
               <div className="rounded-xl bg-zinc-900 p-4">
                 <h2 className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">Enrolled</h2>
