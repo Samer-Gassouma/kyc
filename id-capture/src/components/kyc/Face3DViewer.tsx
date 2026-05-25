@@ -70,6 +70,7 @@ export default function Face3DViewer({ points, faceTexture, cropMeta, width=400,
     }
 
     const triIndices = buildTriangleIndices();
+    console.log("[3D] triangles:", triIndices.length / 3, "points:", points.length, "hasTexture:", !!faceTexture);
     const geo = new THREE.BufferGeometry();
     geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
     geo.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
