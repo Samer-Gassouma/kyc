@@ -8,7 +8,7 @@ Models set up:
   1. YOLOv8n — general object detection (ultralytics auto-download)
   2. Faster R-CNN ResNet-50 FPN — pretrained COCO (torchvision)
   3. MobileNetV3-Small — exported to ONNX for in-browser quality check
-  4. FaceNet (InceptionResnetV1) — pretrained VGGFace2 (facenet-pytorch)
+  4. SAM ViT-B — card segmentation
   5. EasyOCR language models — pre-downloaded
 """
 
@@ -143,24 +143,7 @@ def setup_quality_onnx():
     print(f"  [done] Quality ONNX: {onnx_dst} → {frontend_dst}")
 
 
-# ── 4. FaceNet (pre-cache) ────────────────────────────────────────
-def setup_facenet():
-    print("  Pre-caching FaceNet (InceptionResnetV1, VGGFace2)...")
-    try:
-        from facenet_pytorch import InceptionResnetV1
-
-        model = InceptionResnetV1(pretrained="vggface2")
-        model.eval()
-        # Save a local copy
-        dst = os.path.join(WEIGHTS_DIR, "facenet_vggface2.pt")
-        import torch
-        torch.save(model.state_dict(), dst)
-        print(f"  [done] FaceNet cached at {dst} ({os.path.getsize(dst) / 1e6:.1f} MB)")
-    except Exception as e:
-        print(f"  [warn] FaceNet download failed: {e}")
-
-
-# ── 5. SAM ViT-B (card segmentation) ──────────────────────────────
+# ── 4. SAM ViT-B (card segmentation) ──────────────────────────────
 def setup_sam():
     dst = os.path.join(WEIGHTS_DIR, "sam_vit_b.pth")
     if os.path.exists(dst):
@@ -193,22 +176,19 @@ def main():
 
     ensure_dirs()
 
-    print("\n[1/6] YOLOv8n (document detection)")
+    print("\n[1/5] YOLOv8n (document detection)")
     setup_yolo()
 
-    print("\n[2/6] Faster R-CNN ResNet-50 FPN (COCO)")
+    print("\n[2/5] Faster R-CNN ResNet-50 FPN (COCO)")
     setup_rcnn()
 
-    print("\n[3/6] MobileNetV3-Small → ONNX (quality classifier)")
+    print("\n[3/5] MobileNetV3-Small → ONNX (quality classifier)")
     setup_quality_onnx()
 
-    print("\n[4/6] FaceNet InceptionResnetV1 (VGGFace2)")
-    setup_facenet()
-
-    print("\n[5/6] SAM ViT-B (card segmentation)")
+    print("\n[4/5] SAM ViT-B (card segmentation)")
     setup_sam()
 
-    print("\n[6/6] EasyOCR language models")
+    print("\n[5/5] EasyOCR language models")
     setup_easyocr()
 
     print("\n" + "=" * 60)

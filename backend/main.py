@@ -6,9 +6,10 @@ import logging
 
 from core.config import settings
 from core.db import init_db
+from core.pg_db import init_pg_db
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routers import auth, capture, extract, gallery, liveness, stream
+from routers import auth, capture, extract, face, gallery, stream
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -34,7 +35,7 @@ app.add_middleware(
 
 # ── Routers ────────────────────────────────────────────────────────
 app.include_router(auth.router)
-app.include_router(liveness.router)
+app.include_router(face.router)
 app.include_router(stream.router)
 app.include_router(capture.router)
 app.include_router(extract.router)
@@ -44,6 +45,11 @@ app.include_router(gallery.router)
 @app.on_event("startup")
 async def startup():
     init_db()
+    try:
+        await init_pg_db()
+        logger.info("PostgreSQL initialized")
+    except Exception as e:
+        logger.warning("PostgreSQL init failed (non-fatal): %s", e)
     logger.info("Database initialized")
     logger.info("CORS origins: %s", origins)
 
@@ -91,6 +97,18 @@ async def startup():
             logger.info("  ✓ EasyOCR loaded")
         except Exception as e:
             logger.warning("  ✗ EasyOCR preload failed: %s", e)
+
+        # InsightFace ArcFace
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: __import__(
+                    "models.face", fromlist=["get_face_encoder"]
+                ).get_face_encoder()._load(),
+            )
+            logger.info("  ✓ InsightFace loaded")
+        except Exception as e:
+            logger.warning("  ✗ InsightFace preload failed: %s", e)
 
         logger.info("All models ready.")
 

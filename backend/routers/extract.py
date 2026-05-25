@@ -321,7 +321,6 @@ async def extract_start(
                     pass
 
             sess.merged_fields = json.dumps(merged)
-            sess.face_crop_base64 = face_b64
             sess.status = "completed"
             db2.commit()
             logger.info("Extraction session %s completed", session_id)
@@ -405,7 +404,6 @@ async def extract_status(
                             pass
 
                     sess.merged_fields = json.dumps(merged)
-                    sess.face_crop_base64 = face_b64
                     sess.status = "completed"
                     db.commit()
                     logger.info("Session %s finalized on status poll", session_id)

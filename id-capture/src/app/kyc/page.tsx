@@ -31,11 +31,10 @@ interface SessionData {
   id_number_from_barcode?: string;
 }
 
-interface FaceMatchResult {
-  match: boolean;
-  score: number;
-  threshold?: number;
-  distance?: number;
+interface VerificationResult {
+  passed: boolean;
+  confidence: number;
+  user_id: string;
 }
 
 type Phase =
@@ -43,18 +42,17 @@ type Phase =
   | "back_id"
   | "extracting"
   | "face_scan"
-  | "matching"
   | "completed"
   | "failed";
 
 export default function KYCPage() {
   const [token, setToken] = useState<string>("");
   const [phase, setPhase] = useState<Phase>("front_id");
-  const [sessionId, setSessionId] = useState<string>("");
   const [sessionData, setSessionData] = useState<SessionData | null>(null);
   const [faceCropUrl, setFaceCropUrl] = useState<string>("");
-  const [faceMatchResult, setFaceMatchResult] =
-    useState<FaceMatchResult | null>(null);
+  const [userId, setUserId] = useState<string>("");
+  const [verificationResult, setVerificationResult] =
+    useState<VerificationResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const frontBlobRef = useRef<Blob | null>(null);
   const backBlobRef = useRef<Blob | null>(null);
@@ -109,7 +107,6 @@ export default function KYCPage() {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const result = await res.json();
         const sid = result.session_id;
-        setSessionId(sid);
 
         // Poll until extraction done
         for (let i = 0; i < 60; i++) {
@@ -129,6 +126,30 @@ export default function KYCPage() {
                 `${API_BASE}${statusJson.face_crop_url}?token=${encodeURIComponent(token)}`
               );
             }
+
+            // Auto-enroll CIN face: fetch the face crop and POST to /api/face/enroll
+            try {
+              const faceCropRes = await fetch(
+                `${API_BASE}${statusJson.face_crop_url}?token=${encodeURIComponent(token)}`
+              );
+              if (faceCropRes.ok) {
+                const faceBlob = await faceCropRes.blob();
+                const enrollForm = new FormData();
+                enrollForm.append("image", faceBlob, "cin_face.jpg");
+                const enrollRes = await fetch(`${API_BASE}/api/face/enroll`, {
+                  method: "POST",
+                  headers: { Authorization: `Bearer ${token}` },
+                  body: enrollForm,
+                });
+                if (enrollRes.ok) {
+                  const enrollData = await enrollRes.json();
+                  setUserId(enrollData.user_id);
+                }
+              }
+            } catch {
+              // non-fatal: can still try face scan
+            }
+
             setPhase("face_scan");
             return;
           }
@@ -150,39 +171,18 @@ export default function KYCPage() {
     [token]
   );
 
-  // ── Step 3: Face scan done → run face match ───────────────────────
+  // ── Step 3: Face scan done → verification result received ──────────
   const handleFaceScanComplete = useCallback(
-    async (passed: boolean) => {
-      if (!passed || !sessionId) {
+    (result: VerificationResult) => {
+      if (!result.passed) {
         setPhase("failed");
-        setError("Face scan did not pass");
+        setError("Face verification did not pass");
         return;
       }
-
-      setPhase("matching");
-
-      try {
-        const res = await fetch(`${API_BASE}/api/face-match/${sessionId}`, {
-          method: "POST",
-          headers: { Authorization: `Bearer ${token}` },
-        });
-
-        if (!res.ok) {
-          const errData = await res.json().catch(() => ({}));
-          setError((errData as { detail?: string }).detail || "Face match failed");
-          setPhase("failed");
-          return;
-        }
-
-        const matchResult: FaceMatchResult = await res.json();
-        setFaceMatchResult(matchResult);
-        setPhase("completed");
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Face match failed");
-        setPhase("failed");
-      }
+      setVerificationResult(result);
+      setPhase("completed");
     },
-    [sessionId, token]
+    []
   );
 
   // ── Step helpers ───────────────────────────────────────────────────
@@ -191,18 +191,16 @@ export default function KYCPage() {
     phase === "back_id" ||
     phase === "extracting" ||
     phase === "face_scan" ||
-    phase === "matching" ||
     phase === "completed"
   )
     completedSteps.push("front_id");
   if (
     phase === "extracting" ||
     phase === "face_scan" ||
-    phase === "matching" ||
     phase === "completed"
   )
     completedSteps.push("back_id");
-  if (phase === "matching" || phase === "completed")
+  if (phase === "completed")
     completedSteps.push("face_scan");
 
   const currentStep: KYCStep =
@@ -278,19 +276,9 @@ export default function KYCPage() {
         {phase === "face_scan" && (
           <FaceScanStep
             token={token}
-            sessionId={sessionId}
+            userId={userId}
             onComplete={handleFaceScanComplete}
           />
-        )}
-
-        {/* Face matching spinner */}
-        {phase === "matching" && (
-          <div className="flex flex-1 flex-col items-center justify-center gap-4">
-            <Loader2 className="h-10 w-10 animate-spin text-blue-400" />
-            <p className="text-sm font-medium text-zinc-300">
-              Matching face to ID photo...
-            </p>
-          </div>
         )}
 
         {/* Results */}
@@ -301,41 +289,37 @@ export default function KYCPage() {
               Verification complete
             </div>
 
-            {/* Face match result */}
-            {faceMatchResult && (
+            {/* Face verification result */}
+            {verificationResult && (
               <div
                 className={`rounded-xl p-4 ${
-                  faceMatchResult.match
+                  verificationResult.passed
                     ? "bg-green-500/10 ring-1 ring-green-500/30"
                     : "bg-red-500/10 ring-1 ring-red-500/30"
                 }`}
               >
                 <h2 className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">
-                  Face Match
+                  Face Verification
                 </h2>
                 <div className="flex items-center gap-2">
-                  {faceMatchResult.match ? (
+                  {verificationResult.passed ? (
                     <CheckCircle className="h-5 w-5 text-green-400" />
                   ) : (
                     <XCircle className="h-5 w-5 text-red-400" />
                   )}
                   <span
                     className={`text-sm font-medium ${
-                      faceMatchResult.match ? "text-green-400" : "text-red-400"
+                      verificationResult.passed ? "text-green-400" : "text-red-400"
                     }`}
                   >
-                    {faceMatchResult.match ? "Match" : "No match"} —{" "}
-                    {((faceMatchResult.score ?? 0) * 100).toFixed(1)}%
+                    {verificationResult.passed ? "Verified" : "Not verified"} —{" "}
+                    {(verificationResult.confidence * 100).toFixed(1)}%
                     confidence
                   </span>
                 </div>
-                {faceMatchResult.distance !== undefined && (
-                  <p className="mt-1 text-xs text-zinc-500">
-                    Distance: {faceMatchResult.distance.toFixed(4)} /{" "}
-                    Threshold:{" "}
-                    {(faceMatchResult.threshold ?? 0).toFixed(4)}
-                  </p>
-                )}
+                <p className="mt-1 text-xs text-zinc-500">
+                  User ID: {verificationResult.user_id}
+                </p>
               </div>
             )}
 
@@ -349,7 +333,7 @@ export default function KYCPage() {
                   {JSON.stringify(
                     {
                       ...sessionData,
-                      face_match: faceMatchResult,
+                      face_verification: verificationResult,
                       face_crop_url: faceCropUrl || null,
                     },
                     null,

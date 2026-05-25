@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { Shield, ScanText } from "lucide-react";
+import { Shield, ScanText, Fingerprint } from "lucide-react";
 
 export default function Home() {
   return (
@@ -20,6 +20,19 @@ export default function Home() {
           <div>
             <p className="font-medium text-zinc-100">Full KYC Flow</p>
             <p className="text-sm text-zinc-500">Capture front & back, extract CIN data</p>
+          </div>
+        </Link>
+
+        <Link
+          href="/face"
+          className="flex items-center gap-4 rounded-xl bg-zinc-900 p-5 transition-colors hover:bg-zinc-800"
+        >
+          <div className="flex h-12 w-12 items-center justify-center rounded-full bg-purple-500/10">
+            <Fingerprint className="h-6 w-6 text-purple-400" />
+          </div>
+          <div>
+            <p className="font-medium text-zinc-100">Face Pipeline Test</p>
+            <p className="text-sm text-zinc-500">Enroll & verify faces — MediaPipe + ArcFace + Silent-Face</p>
           </div>
         </Link>
 

@@ -118,48 +118,12 @@ def _save_roi_result(
     raw_ocr: list[dict[str, Any]],
     face_crop: np.ndarray | None,
 ) -> None:
-    """Persist ROI extraction result to DB and store face crop if present."""
+    """Persist ROI extraction result to DB and store face crop base64 for enrollment."""
     db = SessionLocal()
     try:
-        # Store face crop to S3 if available (front side only)
-        face_key: str | None = None
-        if side == "front":
-            if face_crop is None:
-                logger.warning(
-                    "[face_crop] capture=%s side=front: face_crop is None", capture_id
-                )
-            else:
-                logger.info(
-                    "[face_crop] capture=%s side=front: shape=%s dtype=%s",
-                    capture_id,
-                    face_crop.shape,
-                    face_crop.dtype,
-                )
-                try:
-                    from core.storage import upload_encrypted
-
-                    ok, buf = cv2.imencode(
-                        ".jpg", face_crop, [cv2.IMWRITE_JPEG_QUALITY, 92]
-                    )
-                    logger.info(
-                        "[face_crop] imencode ok=%s buf_len=%s",
-                        ok,
-                        len(buf) if ok else 0,
-                    )
-                    if ok:
-                        face_key = upload_encrypted(
-                            buf.tobytes(),
-                            prefix=f"captures/{capture_id}/face_crop",
-                        )
-                        logger.info("[face_crop] uploaded key=%s", face_key)
-                except Exception as exc:
-                    logger.warning("[face_crop] upload failed: %s", exc)
-
-        # Update capture record with face crop key and mark completed
+        # Update capture record and mark completed
         capture = db.query(Capture).filter_by(id=capture_id).first()
         if capture:
-            if face_key:
-                capture.face_crop_s3_key = face_key
             capture.status = "completed"
 
         # Compute average OCR confidence

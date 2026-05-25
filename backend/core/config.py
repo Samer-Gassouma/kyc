@@ -32,6 +32,10 @@ class Settings(BaseSettings):
 
     # ── Database ───────────────────────────────────────────────────
     database_url: str = "sqlite:///./kyc.db"
+    pg_database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5433/kyc"
+
+    # ── Face ───────────────────────────────────────────────────────
+    face_match_threshold: float = 0.35
 
     # ── Encryption ─────────────────────────────────────────────────
     aes_encryption_key: str = "0123456789abcdef0123456789abcdef"
