@@ -105,4 +105,46 @@ export function bboxFromLandmarks(pts: NormalizedLandmark[]) {
   return { x: minX, y: minY, width: maxX-minX, height: maxY-minY };
 }
 
+/** Build triangle indices from all REGION_EDGES — deduplicated, for Three.js indexed geometry */
+export function buildTriangleIndices(): number[] {
+  const edgeMap = new Map<number, Set<number>>();
+  for (const [, region] of Object.entries(REGION_EDGES)) {
+    for (const [a, b] of region.edges) {
+      if (!edgeMap.has(a)) edgeMap.set(a, new Set());
+      edgeMap.get(a)!.add(b);
+      if (!edgeMap.has(b)) edgeMap.set(b, new Set());
+      edgeMap.get(b)!.add(a);
+    }
+  }
+  const tris: number[] = [];
+  const added = new Set<string>();
+  for (const [, region] of Object.entries(REGION_EDGES)) {
+    for (const [a, b] of region.edges) {
+      const aN = edgeMap.get(a); if (!aN) continue;
+      for (const c of aN) {
+        if (c === b) continue;
+        const bN = edgeMap.get(b);
+        if (bN && bN.has(c)) {
+          const key = [a, b, c].sort((x, y) => x - y).join(",");
+          if (!added.has(key)) { added.add(key); tris.push(a, b, c); }
+        }
+      }
+    }
+  }
+  return tris;
+}
+
+/** Crop face region from video and return as data URL */
+export function cropFaceFromVideo(video: HTMLVideoElement, box: { x: number; y: number; width: number; height: number }, pad=0.25): string {
+  const p = box.width * pad;
+  const sx = Math.max(0, box.x - p);
+  const sy = Math.max(0, box.y - p);
+  const sw = Math.min(video.videoWidth  - sx, box.width  + p * 2);
+  const sh = Math.min(video.videoHeight - sy, box.height + p * 2);
+  const c = document.createElement("canvas"); c.width = sw; c.height = sh;
+  c.getContext("2d")!.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
+  // Store crop params as data attributes on the returned URL for UV remapping
+  return JSON.stringify({ url: c.toDataURL("image/jpeg", 0.92), sx, sy, sw, sh, vw: video.videoWidth, vh: video.videoHeight });
+}
+
 export type { NormalizedLandmark };
