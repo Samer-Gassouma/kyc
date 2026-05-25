@@ -20,6 +20,7 @@ export default function FacePage() {
   const [result, setResult] = useState<any>(null);
   const [countdown, setCountdown] = useState(0);
   const [scanPoints, setScanPoints] = useState<{x:number,y:number,z:number}[]>([]);
+  const [faceTex, setFaceTex] = useState("");
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
@@ -111,7 +112,21 @@ export default function FacePage() {
 
   async function handleCapture(video: HTMLVideoElement, pts: any[]) {
     setPhase("capturing"); setStatusMsg("Capturing...");
-    setScanPoints(pts.map((p:any)=>({x:p.x,y:p.y,z:p.z})));
+    const savedPts = pts.map((p:any)=>({x:p.x,y:p.y,z:p.z}));
+    setScanPoints(savedPts);
+
+    // Crop face region for texture
+    let bx=Infinity,by=Infinity,bX=-Infinity,bY=-Infinity;
+    for (const p of pts) { if(p.x<bx)bx=p.x; if(p.x>bX)bX=p.x; if(p.y<by)by=p.y; if(p.y>bY)bY=p.y; }
+    const pad = 0.25;
+    const fw = bX - bx, fh = bY - by;
+    const sx = Math.max(0, (bx - fw*pad) * video.videoWidth);
+    const sy = Math.max(0, (by - fh*pad) * video.videoHeight);
+    const sw = Math.min(video.videoWidth - sx, fw * (1+pad*2) * video.videoWidth);
+    const sh = Math.min(video.videoHeight - sy, fh * (1+pad*2) * video.videoHeight);
+    const cc = document.createElement("canvas"); cc.width = sw; cc.height = sh;
+    cc.getContext("2d")!.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
+    setFaceTex(cc.toDataURL("image/jpeg", 0.9));
 
     const c = document.createElement("canvas");
     c.width=video.videoWidth; c.height=video.videoHeight;
@@ -222,7 +237,7 @@ export default function FacePage() {
             </div>
           )}
           {phase==="done" && scanPoints.length>0 && (
-            <Face3DViewer points={scanPoints.map(p=>[p.x,p.y,p.z])} width={368} height={460}/>
+            <Face3DViewer points={scanPoints.map(p=>[p.x,p.y,p.z])} faceTexture={faceTex} width={368} height={460}/>
           )}
         </div>
 
