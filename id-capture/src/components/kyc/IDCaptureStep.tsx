@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
-import { useCardDetection } from "@/hooks/useCardDetection";
 import { API_BASE } from "@/lib/apiBase";
 import { Camera, AlertTriangle } from "lucide-react";
 
@@ -16,17 +15,13 @@ export default function IDCaptureStep({ side, token, onCaptureComplete }: Props)
   const overlayRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const animRef = useRef(0);
-  const detectCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   const [phase, setPhase] = useState<"camera" | "preview">("camera");
-  const [cardDetected, setCardDetected] = useState(false);
   const [capturedURL, setCapturedURL] = useState("");
   const [capturedBlob, setCapturedBlob] = useState<Blob | null>(null);
   const [qualityWarn, setQualityWarn] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  const { detect, drawHighlight } = useCardDetection();
 
   const stop = useCallback(() => {
     cancelAnimationFrame(animRef.current);
@@ -35,7 +30,7 @@ export default function IDCaptureStep({ side, token, onCaptureComplete }: Props)
   }, []);
 
   const startCam = useCallback(async () => {
-    setError(null); setPhase("camera"); setCardDetected(false);
+    setError(null); setPhase("camera");
     try {
       const s = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } },
@@ -49,30 +44,63 @@ export default function IDCaptureStep({ side, token, onCaptureComplete }: Props)
 
   useEffect(() => { startCam(); return stop; }, []); // eslint-disable-line
 
+  // Draw static card guide frame
   useEffect(() => {
     if (phase !== "camera") return;
-    if (!detectCanvasRef.current) detectCanvasRef.current = document.createElement("canvas");
     let running = true;
-
     const loop = () => {
       if (!running) return;
       const v = videoRef.current;
-      const dc = detectCanvasRef.current;
       const ov = overlayRef.current;
-      if (!v || v.videoWidth === 0 || !dc || !ov) {
-        animRef.current = requestAnimationFrame(loop); return;
-      }
-      const result = detect(v, dc);
-      setCardDetected(result.detected);
+      if (!v || v.videoWidth === 0 || !ov) { animRef.current = requestAnimationFrame(loop); return; }
+
       ov.width = v.videoWidth; ov.height = v.videoHeight;
       const ctx = ov.getContext("2d");
-      if (ctx) { ctx.clearRect(0, 0, ov.width, ov.height); if (result.detected) drawHighlight(ov, result); }
+      if (ctx) {
+        ctx.clearRect(0, 0, ov.width, ov.height);
+        drawGuide(ctx, ov.width, ov.height);
+      }
       animRef.current = requestAnimationFrame(loop);
     };
     animRef.current = requestAnimationFrame(loop);
     return () => { running = false; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase]);
+
+  function drawGuide(ctx: CanvasRenderingContext2D, w: number, h: number) {
+    // Card guide: centered rectangle with ~1.58:1 aspect ratio (ID card)
+    const margin = 0.08;
+    const gw = w * (1 - margin * 2);
+    const gh = gw / 1.58;
+    const gx = (w - gw) / 2;
+    const gy = (h - gh) / 2;
+
+    // Dim outside the guide
+    ctx.fillStyle = "rgba(0,0,0,0.45)";
+    ctx.fillRect(0, 0, w, gy);
+    ctx.fillRect(0, gy + gh, w, h - gy - gh);
+    ctx.fillRect(0, gy, gx, gh);
+    ctx.fillRect(gx + gw, gy, w - gx - gw, gh);
+
+    // Guide border — dashed white
+    ctx.strokeStyle = "rgba(255,255,255,0.6)";
+    ctx.lineWidth = 2;
+    ctx.setLineDash([8, 4]);
+    ctx.strokeRect(gx, gy, gw, gh);
+    ctx.setLineDash([]);
+
+    // Corner brackets
+    const bs = Math.min(28, gw * 0.1);
+    ctx.strokeStyle = "rgba(255,255,255,0.8)";
+    ctx.lineWidth = 3;
+    const corners = [[gx,gy],[gx+gw,gy],[gx+gw,gy+gh],[gx,gy+gh]];
+    corners.forEach(([cx, cy]) => {
+      const bx = cx === gx ? 1 : -1;
+      const by = cy === gy ? 1 : -1;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy + by * bs); ctx.lineTo(cx, cy); ctx.lineTo(cx + bx * bs, cy);
+      ctx.stroke();
+    });
+  }
 
   function handleCapture() {
     const v = videoRef.current; if (!v) return;
@@ -84,7 +112,7 @@ export default function IDCaptureStep({ side, token, onCaptureComplete }: Props)
     let bright = 0;
     for (let i = 0; i < img.length; i += 4) bright += (img[i] + img[i + 1] + img[i + 2]) / 3;
     bright /= (img.length / 4);
-    if (bright < 50) setQualityWarn("Too dark — try better lighting");
+    if (bright < 60) setQualityWarn("Too dark — try better lighting");
     else if (bright > 220) setQualityWarn("Overexposed — move away from light");
     else setQualityWarn(null);
     c.toBlob(blob => {
@@ -141,10 +169,10 @@ export default function IDCaptureStep({ side, token, onCaptureComplete }: Props)
       </div>
       {phase === "camera" && (
         <>
-          <p className="text-sm text-zinc-400">{cardDetected ? "Card detected — ready to capture" : "Position your ID card flat in the frame"}</p>
-          <button onClick={handleCapture} disabled={!cardDetected}
-            className={`w-full py-4 rounded-2xl text-white font-semibold text-lg transition-all ${cardDetected ? "bg-green-500 shadow-lg shadow-green-500/30 active:scale-95" : "bg-zinc-700 text-zinc-500 cursor-not-allowed"}`}>
-            <Camera className="mr-2 inline h-5 w-5" />{cardDetected ? "Capture Card" : "Waiting for card..."}
+          <p className="text-sm text-zinc-400">Align your card within the guide frame</p>
+          <button onClick={handleCapture}
+            className="w-full py-4 rounded-2xl bg-green-500 text-white font-semibold text-lg shadow-lg shadow-green-500/30 active:scale-95 transition-all">
+            <Camera className="mr-2 inline h-5 w-5" />Capture {side === "front" ? "Front" : "Back"}
           </button>
         </>
       )}
