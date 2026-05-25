@@ -7,6 +7,7 @@ import { useMediaPipeFace } from "@/hooks/useMediaPipeFace";
 import { checkLiveness, prepareLivenessInput } from "@/lib/silentFaceLiveness";
 import Link from "next/link";
 import { ArrowLeft, Camera, Loader2, CheckCircle, XCircle, UserPlus, Fingerprint, ArrowUp, ArrowLeftCircle, ArrowRightCircle, Focus } from "lucide-react";
+import Face3DViewer from "@/components/kyc/Face3DViewer";
 
 type Mode = "enroll" | "verify";
 type Angle = "center" | "left" | "right" | "up";
@@ -41,6 +42,7 @@ export default function FacePage() {
   const [angleProgress, setAngleProgress] = useState(0); // 0-100 per angle
   const [completedAngles, setCompletedAngles] = useState<Set<Angle>>(new Set());
   const [meshVisible, setMeshVisible] = useState(false);
+  const [scanLandmarks, setScanLandmarks] = useState<number[][]>([]);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
@@ -71,6 +73,7 @@ export default function FacePage() {
     setErrMsg(null); setResult(null); setPhase("active");
     setCurrentAngle("center"); setAngleProgress(0);
     setCompletedAngles(new Set()); setMeshVisible(false);
+    setScanLandmarks([]);
     capturedFrames.current.clear();
     captureInProgress.current = false;
     angleStableRef.current = 0;
@@ -126,17 +129,22 @@ export default function FacePage() {
     const noseOffsetX = (nose.x - faceCenterX) / faceWidth;
 
     // Yaw detection: nose horizontal offset from face center
-    if (noseOffsetX < -0.15) return "left";
-    if (noseOffsetX > 0.15) return "right";
+    // In the un-mirrored camera image, the person's LEFT side appears on
+    // the RIGHT of the frame. So noseOffsetX > 0 means nose is on the
+    // right side of the image = person turned their head LEFT.
+    if (noseOffsetX > 0.12) return "left";
+    if (noseOffsetX < -0.12) return "right";
 
-    // Pitch detection: nose vertical relative to eye-chin range
+    // Pitch detection: in image coords, y=0 is top.
+    // When looking UP, nose tip is HIGHER in the image (smaller y).
+    // noseRelY = (nose.y - eyeY) / faceHeight < 0 means nose above eyes = looking UP
     const faceHeight = Math.abs(chin.y - forehead.y);
     const eyeY = (leftEye.y + rightEye.y) / 2;
-    const noseRelY = (nose.y - eyeY) / faceHeight;
-    if (noseRelY > 0.35) return "up";
+    const noseRelY = (nose.y - eyeY) / Math.max(faceHeight, 0.01);
+    if (noseRelY < -0.08) return "up";
 
-    // Center
-    if (Math.abs(noseOffsetX) < 0.08) return "center";
+    // Center: nose roughly centered horizontally and not looking up
+    if (Math.abs(noseOffsetX) < 0.08 && noseRelY > -0.05) return "center";
 
     return null; // between angles — transitioning
   }
@@ -247,7 +255,10 @@ export default function FacePage() {
       setStatusMsg(ANGLE_LABEL[nextAngle]);
       setPhase("active");
     } else {
-      // All angles captured — verify
+      // All angles captured — save landmarks for 3D view, then verify
+      if (landmarks && landmarks[0]) {
+        setScanLandmarks(landmarks[0].map((p: any) => [p.x, p.y, p.z]));
+      }
       setPhase("verifying");
       setStatusMsg("Processing...");
       await runVerification();
@@ -513,6 +524,14 @@ export default function FacePage() {
         {/* Results */}
         {phase === "done" && result && (
           <div className="mt-4 w-full space-y-3">
+            {/* 3D Face Scan */}
+            {scanLandmarks.length > 0 && (
+              <div className="rounded-xl bg-zinc-900 p-4">
+                <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-zinc-500">3D Face Scan</h2>
+                <p className="mb-2 text-xs text-zinc-600">Drag to rotate — scroll to zoom</p>
+                <Face3DViewer landmarks={scanLandmarks} tessellation={TESSELATION} width={368} height={400} />
+              </div>
+            )}
             {mode === "enroll" && (
               <div className="rounded-xl bg-zinc-900 p-4">
                 <h2 className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">Enrolled</h2>
