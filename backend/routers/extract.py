@@ -15,7 +15,6 @@ from core.config import settings
 from core.db import Capture, ExtractionSession, KYCResult, SessionLocal
 from core.storage import upload_encrypted
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from models.quality_checker import check_quality
 from models.yolo_detector import detect_frame
 
 logger = logging.getLogger(__name__)
@@ -137,11 +136,6 @@ def _prepare_and_dispatch(
     if image is None:
         raise ValueError("Invalid image data")
 
-    # Quick quality check
-    quality = check_quality(image)
-    if not quality["quality_passed"]:
-        raise ValueError("; ".join(quality["issues"]))
-
     # YOLO detect + perspective correct
     from models.geometry import analyze_frame, correct_perspective
 
@@ -154,11 +148,7 @@ def _prepare_and_dispatch(
     if geo.detected and geo.corners is not None:
         corrected = correct_perspective(image, geo.corners)
 
-    # Quality-check corrected card
     card_crop = corrected if corrected is not None else image
-    quality2 = check_quality(card_crop)
-    if not quality2["quality_passed"]:
-        raise ValueError("; ".join(quality2["issues"]))
 
     # Persist capture
     db = SessionLocal()
