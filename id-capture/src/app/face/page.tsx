@@ -67,12 +67,18 @@ export default function FacePage() {
 
   // ── Frame loop ─────────────────────────────────────────────────
 
-  useEffect(() => {
-    if (phase !== "active") return;
-    if (!detectCanvasRef.current) detectCanvasRef.current = document.createElement("canvas");
+  const stableRef = useRef(0);     // 0–30 progress
+  const captureRef = useRef(false);
+  const [progress, setProgress] = useState(0);
 
-    let stable = 0;
-    let captured = false;
+  useEffect(() => {
+    if (phase !== "active") {
+      stableRef.current = 0;
+      captureRef.current = false;
+      setProgress(0);
+      return;
+    }
+    if (!detectCanvasRef.current) detectCanvasRef.current = document.createElement("canvas");
 
     const loop = () => {
       const video = videoRef.current;
@@ -82,26 +88,27 @@ export default function FacePage() {
         return;
       }
 
-      // Detect + draw frame in one call
       detect(video, dCanvas);
-
-      // Draw landmarks overlay
       drawOverlay(video);
 
-      // Auto-capture when face is well-positioned
-      if (!captured && faceIsWellPositioned()) {
-        stable++;
-        const remaining = Math.max(1, Math.ceil((30 - stable) / 10));
-        setStatusMsg(`Hold still... ${remaining}`);
-        if (stable >= 30) {
-          captured = true;
-          handleAction();
-          return; // loop stops, handleAction takes over
+      if (!captureRef.current) {
+        if (faceIsWellPositioned()) {
+          stableRef.current = Math.min(30, stableRef.current + 1);
+        } else {
+          stableRef.current = Math.max(0, stableRef.current - 2);
         }
-      } else if (!captured) {
-        stable = 0;
-        if (landmarks) {
-          setStatusMsg("Center your face in the oval");
+        const pct = Math.round((stableRef.current / 30) * 100);
+        setProgress(pct);
+
+        if (stableRef.current >= 30) {
+          captureRef.current = true;
+          setStatusMsg("Processing...");
+          handleAction();
+          return;
+        } else if (stableRef.current > 15) {
+          setStatusMsg("Hold still...");
+        } else if (landmarks) {
+          setStatusMsg("Center your face in the frame");
         } else {
           setStatusMsg(mode === "enroll" ? "Position your face" : "Position your face");
         }
@@ -130,7 +137,33 @@ export default function FacePage() {
     return area > 0.06 && Math.sqrt((cx - 0.5) ** 2 + (cy - 0.5) ** 2) < 0.3;
   }
 
-  // ── Overlay ────────────────────────────────────────────────────
+  // ── Face mesh connections (MediaPipe topology) ─────────────────
+
+  // Indices for key facial feature contours
+  const FACE_OVAL = [10,338,297,332,284,251,389,356,454,323,361,288,397,365,379,378,400,377,152,148,176,149,150,136,172,58,132,93,234,127,162,21,54,103,67,109];
+  const LEFT_EYE = [33,7,163,144,145,153,154,155,133,173,157,158,159,160,161,246];
+  const RIGHT_EYE = [362,382,381,380,374,373,390,249,263,466,388,387,386,385,384,398];
+  const LEFT_EYEBROW = [46,53,52,65,55,70,63,105,66,107];
+  const RIGHT_EYEBROW = [276,283,282,295,285,300,293,334,296,336];
+  const NOSE_BRIDGE = [6,168,197,195,5,4,1,19,94,2];
+  const NOSE_TIP = [1,2,98,327,460,459,458,461,354,455,460];
+  const LIPS_OUTER = [61,146,91,181,84,17,314,405,321,375,291,409,270,269,267,0,37,39,40,185];
+  const LIPS_INNER = [78,191,80,81,82,13,312,311,310,415,308,324,318,402,317,14,87,178,88,95];
+
+  function drawMeshLine(ctx: CanvasRenderingContext2D, pts: any[], indices: number[], w: number, h: number, color: string, width: number) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.beginPath();
+    for (let i = 0; i < indices.length; i++) {
+      const p = pts[indices[i]];
+      if (!p) continue;
+      const x = p.x * w, y = p.y * h;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.stroke();
+  }
 
   function drawOverlay(video: HTMLVideoElement) {
     const canvas = overlayRef.current;
@@ -143,22 +176,39 @@ export default function FacePage() {
     if (!landmarks || !landmarks[0]) return;
 
     const pts = landmarks[0];
-    ctx.fillStyle = "rgba(59, 130, 246, 0.55)";
-    for (const p of pts) {
-      ctx.beginPath();
-      ctx.arc(p.x * canvas.width, p.y * canvas.height, 1.6, 0, Math.PI * 2);
-      ctx.fill();
+    const w = canvas.width, h = canvas.height;
+    const positioned = faceIsWellPositioned();
+    const alpha = positioned ? "0.8" : "0.3";
+
+    // Face oval
+    drawMeshLine(ctx, pts, FACE_OVAL, w, h, `rgba(255,255,255,${alpha})`, 2);
+
+    // Eyes
+    drawMeshLine(ctx, pts, LEFT_EYE, w, h, `rgba(96,165,250,${alpha})`, 1.5);
+    drawMeshLine(ctx, pts, RIGHT_EYE, w, h, `rgba(96,165,250,${alpha})`, 1.5);
+
+    // Eyebrows
+    drawMeshLine(ctx, pts, LEFT_EYEBROW, w, h, `rgba(250,204,21,${alpha})`, 2);
+    drawMeshLine(ctx, pts, RIGHT_EYEBROW, w, h, `rgba(250,204,21,${alpha})`, 2);
+
+    // Nose
+    drawMeshLine(ctx, pts, NOSE_BRIDGE, w, h, `rgba(168,85,247,${alpha})`, 1.5);
+    drawMeshLine(ctx, pts, NOSE_TIP, w, h, `rgba(168,85,247,${alpha})`, 1.5);
+
+    // Lips
+    drawMeshLine(ctx, pts, LIPS_OUTER, w, h, `rgba(239,68,68,${alpha})`, 1.5);
+    drawMeshLine(ctx, pts, LIPS_INNER, w, h, `rgba(239,68,68,${alpha})`, 1);
+
+    // Iris centers
+    if (pts[468] && pts[473]) {
+      [[468,4],[473,4]].forEach(([idx,r]) => {
+        const p = pts[idx as number];
+        ctx.fillStyle = `rgba(255,255,255,${alpha})`;
+        ctx.beginPath();
+        ctx.arc(p.x * w, p.y * h, (r as number), 0, Math.PI * 2);
+        ctx.fill();
+      });
     }
-    const chin = pts[152], forehead = pts[10], left = pts[234], right = pts[454];
-    const cx = ((left.x + right.x) / 2) * canvas.width;
-    const cy = ((forehead.y + chin.y) / 2) * canvas.height;
-    const rx = Math.abs(right.x - left.x) / 2 * canvas.width * 1.3;
-    const ry = Math.abs(chin.y - forehead.y) / 2 * canvas.height * 1.3;
-    ctx.strokeStyle = faceIsWellPositioned() ? "rgba(34,197,94,0.5)" : "rgba(255,255,255,0.2)";
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
-    ctx.stroke();
   }
 
   // ── Enroll or Verify ───────────────────────────────────────────
@@ -292,7 +342,19 @@ export default function FacePage() {
 
         {/* Status / Error */}
         <div className="mt-4 text-center">
-          {phase === "active" && <p className="text-sm text-zinc-400"><Camera className="mr-1 inline h-4 w-4" />{isReady ? statusMsg : "Loading face detection..."}</p>}
+          {phase === "active" && (
+            <div className="flex flex-col items-center gap-2">
+              <p className="text-sm text-zinc-400"><Camera className="mr-1 inline h-4 w-4" />{isReady ? statusMsg : "Loading face detection..."}</p>
+              {progress > 0 && (
+                <div className="h-1.5 w-48 overflow-hidden rounded-full bg-zinc-700">
+                  <div
+                    className="h-full rounded-full bg-blue-400 transition-all duration-200"
+                    style={{ width: `${progress}%` }}
+                  />
+                </div>
+              )}
+            </div>
+          )}
           {phase === "verifying" && <p className="text-sm text-blue-400"><Loader2 className="mr-1 inline h-4 w-4 animate-spin" />{statusMsg}</p>}
           {phase === "error" && (
             <div className="flex flex-col items-center gap-3">
