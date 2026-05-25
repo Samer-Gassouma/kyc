@@ -151,16 +151,10 @@ def validate_capture(image: np.ndarray, side: str = "front") -> dict[str, Any]:
             box_area = (bx2 - bx1) * (by2 - by1)
             frame_area = h * w
 
-            # Check if detection covers reasonable area
-            if box_area < frame_area * 0.05:
-                rejection_reason = "Card appears too small — move closer"
-            if bx1 < 3 or by1 < 3 or bx2 > w - 3 or by2 > h - 3:
-                if rejection_reason is None:
-                    rejection_reason = "Card edges are clipped — please recapture"
     else:
         # Contour-based validation as R-CNN substitute
         contour, area_ratio = _find_card_contour(image)
-        if contour is None or area_ratio < 0.15:
+        if contour is None:
             rejection_reason = "No document detected in image"
         rcnn_conf = min(area_ratio * 2, 1.0)
 
