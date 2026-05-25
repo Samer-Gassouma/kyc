@@ -89,16 +89,20 @@ export default function FacePage() {
 
     let running = true;
     let captureTriggered = false;
+    let detecting = false; // prevent concurrent detect() calls
 
     async function loop() {
       if (!running) return;
       const video = videoRef.current;
-      if (!video || video.videoWidth === 0) {
+      if (!video || video.videoWidth === 0 || detecting) {
         animRef.current = requestAnimationFrame(loop);
         return;
       }
 
-      const result = await detect(video);
+      detecting = true;
+      let result;
+      try { result = await detect(video); } catch { result = null; }
+      detecting = false;
       if (!running) return;
 
       if (result) {
@@ -299,7 +303,7 @@ export default function FacePage() {
     if (!video || video.videoWidth === 0 || pts.length < 30) return [];
     const c = document.createElement("canvas");
     c.width = video.videoWidth; c.height = video.videoHeight;
-    const ctx = c.getContext("2d");
+    const ctx = c.getContext("2d", { willReadFrequently: true });
     if (!ctx) return [];
     ctx.drawImage(video, 0, 0);
     const colors: string[] = [];
