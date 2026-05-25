@@ -109,7 +109,7 @@ export default function KYCPage() {
         const sid = result.session_id;
 
         // Poll until extraction done
-        for (let i = 0; i < 60; i++) {
+        for (let i = 0; i < 180; i++) {
           await new Promise((r) => setTimeout(r, 2000));
 
           const statusRes = await fetch(
