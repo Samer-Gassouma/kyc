@@ -31,6 +31,7 @@ async def enroll(
     user_id: str | None = Form(None),
     landmarks_3d: str | None = Form(None),
     liveness_score: float = Form(0.0),
+    quality_score: float = Form(0.0),
     _user: dict = Depends(get_current_user_or_api_key),
     pg_db: AsyncSession = Depends(get_pg_db),
 ) -> dict[str, Any]:
@@ -80,6 +81,7 @@ async def enroll(
         embedding=embedding.tolist(),
         landmarks_3d=landmarks_json,
         liveness_score=liveness_score,
+        quality_score=quality_score if quality_score > 0 else None,
         verified=True,
     )
     pg_db.add(profile)
