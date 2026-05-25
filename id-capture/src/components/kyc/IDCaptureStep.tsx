@@ -1,332 +1,161 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import { ImagePlus } from "lucide-react";
-import { useCamera } from "@/hooks/useCamera";
-import { useONNXQuality } from "@/hooks/useONNXQuality";
-import { useIDWebSocket } from "@/hooks/useIDWebSocket";
-import { useAutoCapture } from "@/hooks/useAutoCapture";
-import { canvasToJpegBlob, grabFrame } from "@/lib/frameEncoder";
+import { useEffect, useRef, useState, useCallback } from "react";
+import { useCardDetection } from "@/hooks/useCardDetection";
 import { API_BASE } from "@/lib/apiBase";
-import CameraOverlay, { BorderState } from "./CameraOverlay";
-import QualityIndicator from "./QualityIndicator";
-import CaptureReview from "./CaptureReview";
+import { Camera, AlertTriangle } from "lucide-react";
 
-interface IDCaptureStepProps {
+interface Props {
   side: "front" | "back";
   token: string;
   onCaptureComplete: (captureId: string, blob: Blob) => void;
 }
 
-type Phase = "camera" | "preview" | "review";
+export default function IDCaptureStep({ side, token, onCaptureComplete }: Props) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const overlayRef = useRef<HTMLCanvasElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const animRef = useRef(0);
+  const detectCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
-export default function IDCaptureStep({
-  side,
-  token,
-  onCaptureComplete,
-}: IDCaptureStepProps) {
-  const { videoRef, isReady, error: camError, start, stop } = useCamera({
-    facingMode: "environment",
-  });
-  const { quality, runCheck } = useONNXQuality();
-  const {
-    detection,
-    isConnected,
-    connect,
-    disconnect,
-    sendFrame,
-  } = useIDWebSocket();
-
-  const [phase, setPhase] = useState<Phase>("camera");
-  const [capturedImageUrl, setCapturedImageUrl] = useState<string>("");
-  const [cropImageUrl, setCropImageUrl] = useState<string>("");
+  const [phase, setPhase] = useState<"camera" | "preview">("camera");
+  const [cardDetected, setCardDetected] = useState(false);
+  const [capturedURL, setCapturedURL] = useState("");
   const [capturedBlob, setCapturedBlob] = useState<Blob | null>(null);
-  const [reviewStatus, setReviewStatus] = useState<
-    "preview" | "validating" | "success" | "failed"
-  >("preview");
-  const [rejectionReason, setRejectionReason] = useState<string | null>(null);
-  const [videoSize, setVideoSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
+  const [qualityWarn, setQualityWarn] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const loopRef = useRef<number | null>(null);
-  const fullResCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const { detect, drawHighlight } = useCardDetection();
 
-  // Start camera + WebSocket on mount
-  useEffect(() => {
-    start();
-    connect();
-    fullResCanvasRef.current = document.createElement("canvas");
-
-    return () => {
-      stop();
-      disconnect();
-      if (loopRef.current) cancelAnimationFrame(loopRef.current);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  const stop = useCallback(() => {
+    cancelAnimationFrame(animRef.current);
+    streamRef.current?.getTracks().forEach(t => t.stop());
+    streamRef.current = null;
   }, []);
 
-  // Main processing loop — send frames to YOLO via WS
+  const startCam = useCallback(async () => {
+    setError(null); setPhase("camera"); setCardDetected(false);
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } },
+        audio: false,
+      });
+      streamRef.current = s;
+      const v = videoRef.current; if (!v) throw new Error("no video");
+      v.srcObject = s; await v.play();
+    } catch (e) { setError(e instanceof Error ? e.message : "Camera error"); }
+  }, []);
+
+  useEffect(() => { startCam(); return stop; }, []); // eslint-disable-line
+
   useEffect(() => {
-    if (!isReady || phase !== "camera") return;
+    if (phase !== "camera") return;
+    if (!detectCanvasRef.current) detectCanvasRef.current = document.createElement("canvas");
+    let running = true;
 
-    const loop = async () => {
-      const video = videoRef.current;
-      if (!video) {
-        loopRef.current = requestAnimationFrame(loop);
-        return;
+    const loop = () => {
+      if (!running) return;
+      const v = videoRef.current;
+      const dc = detectCanvasRef.current;
+      const ov = overlayRef.current;
+      if (!v || v.videoWidth === 0 || !dc || !ov) {
+        animRef.current = requestAnimationFrame(loop); return;
       }
-
-      if (isConnected) {
-        await sendFrame(video);
-      }
-
-      loopRef.current = requestAnimationFrame(loop);
+      const result = detect(v, dc);
+      setCardDetected(result.detected);
+      ov.width = v.videoWidth; ov.height = v.videoHeight;
+      const ctx = ov.getContext("2d");
+      if (ctx) { ctx.clearRect(0, 0, ov.width, ov.height); if (result.detected) drawHighlight(ov, result); }
+      animRef.current = requestAnimationFrame(loop);
     };
+    animRef.current = requestAnimationFrame(loop);
+    return () => { running = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase]);
 
-    loopRef.current = requestAnimationFrame(loop);
-
-    return () => {
-      if (loopRef.current) cancelAnimationFrame(loopRef.current);
-    };
-  }, [isReady, phase, isConnected, videoRef, runCheck, sendFrame]);
-
-  // Pause camera when leaving camera phase
-  const pauseCamera = useCallback(() => {
-    stop();
-    disconnect();
-    if (loopRef.current) cancelAnimationFrame(loopRef.current);
-  }, [stop, disconnect]);
-
-  // ── Capture: grab frame, show preview ─────────────────────────
-  const doCapture = useCallback(
-    async (blob: Blob) => {
-      const url = URL.createObjectURL(blob);
+  function handleCapture() {
+    const v = videoRef.current; if (!v) return;
+    const c = document.createElement("canvas");
+    c.width = v.videoWidth; c.height = v.videoHeight;
+    const ctx = c.getContext("2d")!;
+    ctx.drawImage(v, 0, 0);
+    const img = ctx.getImageData(0, 0, c.width, c.height).data;
+    let bright = 0;
+    for (let i = 0; i < img.length; i += 4) bright += (img[i] + img[i + 1] + img[i + 2]) / 3;
+    bright /= (img.length / 4);
+    if (bright < 50) setQualityWarn("Too dark — try better lighting");
+    else if (bright > 220) setQualityWarn("Overexposed — move away from light");
+    else setQualityWarn(null);
+    c.toBlob(blob => {
+      if (!blob) return;
       setCapturedBlob(blob);
-      setCapturedImageUrl(url);
-      setCropImageUrl("");
-      setRejectionReason(null);
-      setReviewStatus("preview");
+      setCapturedURL(URL.createObjectURL(blob));
       setPhase("preview");
-      pauseCamera();
-    },
-    [pauseCamera]
-  );
-
-  // ── Manual capture (button press) ─────────────────────────────
-  const handleManualCapture = useCallback(async () => {
-    const video = videoRef.current;
-    const canvas = fullResCanvasRef.current;
-    if (!video || !canvas) return;
-
-    grabFrame(video, canvas);
-    const blob = await canvasToJpegBlob(canvas, 0.95);
-    await doCapture(blob);
-  }, [videoRef, doCapture]);
-
-  // ── Auto-capture (hold still 1.5s) ────────────────────────────
-  const readyToCapture = detection?.ready_to_capture ?? false;
-  const { isHolding, holdProgress, reset: resetAutoCapture } = useAutoCapture(
-    readyToCapture && phase === "camera",
-    handleManualCapture
-  );
-
-  // ── User clicked "Use This" → accept immediately ──────────────
-  const handleProceed = useCallback(async () => {
-    if (!capturedBlob) return;
-
-    const captureId = `cap_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-    setReviewStatus("success");
-    setTimeout(() => onCaptureComplete(captureId, capturedBlob), 600);
-  }, [capturedBlob, onCaptureComplete]);
-
-  // ── Gallery upload → preview, then validate ───────────────────
-  const submitGallery = useCallback(
-    async (file: File) => {
-      const url = URL.createObjectURL(file);
-      setCapturedBlob(file);
-      setCapturedImageUrl(url);
-      setCropImageUrl("");
-      setRejectionReason(null);
-      setReviewStatus("preview");
-      setPhase("preview");
-      pauseCamera();
-    },
-    [pauseCamera]
-  );
-
-  const handleGallerySelect = useCallback(
-    async (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      if (!file) return;
-      await submitGallery(file);
-      if (fileInputRef.current) fileInputRef.current.value = "";
-    },
-    [submitGallery]
-  );
-
-  // ── Retry: back to camera ─────────────────────────────────────
-  const handleRetry = useCallback(() => {
-    setPhase("camera");
-    setCapturedImageUrl("");
-    setCropImageUrl("");
-    setCapturedBlob(null);
-    setReviewStatus("preview");
-    setRejectionReason(null);
-    resetAutoCapture();
-    start();
-    connect();
-  }, [start, connect, resetAutoCapture]);
-
-  // ── Border state from detection result ────────────────────────
-  const getBorderState = (): BorderState => {
-    if (!detection || !detection.detected) return "neutral";
-    if (detection.ready_to_capture) return "success";
-    if (detection.issues.length > 2 || detection.confidence < 0.6) return "error";
-    return "warning";
-  };
-
-  const sideLabel = side === "front" ? "Front of ID" : "Back of ID";
-
-  // ── Preview / Review phase ────────────────────────────────────
-  if (phase === "preview" || phase === "review") {
-    return (
-      <CaptureReview
-        imageUrl={capturedImageUrl}
-        cropImageUrl={cropImageUrl}
-        status={reviewStatus}
-        rejectionReason={rejectionReason}
-        onRetry={handleRetry}
-        onProceed={handleProceed}
-      />
-    );
+    }, "image/jpeg", 0.92);
   }
 
-  // ── Camera phase ──────────────────────────────────────────────
+  function handleRetake() {
+    if (capturedURL) URL.revokeObjectURL(capturedURL);
+    setCapturedURL(""); setCapturedBlob(null); setQualityWarn(null);
+    setPhase("camera");
+  }
+
+  async function handleProceed() {
+    if (!capturedBlob) return;
+    setSubmitting(true);
+    try {
+      const fd = new FormData();
+      fd.append("file", capturedBlob, `${side}.jpg`);
+      fd.append("side", side);
+      const res = await fetch(`${API_BASE}/api/capture/validate`, {
+        method: "POST", headers: { Authorization: `Bearer ${token}` }, body: fd,
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (!data.validation_passed && data.rejection_reason) {
+        setError(data.rejection_reason); handleRetake(); setSubmitting(false); return;
+      }
+      onCaptureComplete(data.capture_id, capturedBlob);
+    } catch (e) { setError(e instanceof Error ? e.message : "Upload failed"); setSubmitting(false); }
+  }
+
+  const label = side === "front" ? "Front of ID" : "Back of ID";
+
   return (
-    <div className="flex w-full flex-col items-center">
-      {/* Camera error */}
-      {camError && (
-        <div className="flex flex-col items-center gap-3 p-8 text-center">
-          <p className="text-sm text-red-400">{camError}</p>
-          <button
-            onClick={start}
-            className="rounded-full bg-blue-600 px-4 py-2 text-sm text-white"
-          >
-            Retry Camera
-          </button>
-        </div>
-      )}
-
-      {/* Video + overlay */}
-      <div
-        className="relative w-full overflow-hidden bg-black"
-        style={{ maxWidth: 480, aspectRatio: "3 / 4" }}
-      >
-        <video
-          ref={videoRef}
-          autoPlay
-          playsInline
-          muted
-          className="h-full w-full object-cover"
-          onLoadedMetadata={(e) => {
-            const v = e.currentTarget;
-            if (v.videoWidth > 0) setVideoSize({ w: v.videoWidth, h: v.videoHeight });
-          }}
-        />
-
-        <CameraOverlay
-          borderState={getBorderState()}
-          holdProgress={holdProgress}
-          label={sideLabel}
-          bbox={detection?.bbox}
-          videoSize={videoSize}
-        />
-
-        {detection?.detected && (
-          <div className="absolute right-3 top-3 z-10 flex items-center gap-1.5 rounded-full bg-black/60 px-2.5 py-1 text-[11px] font-medium text-white backdrop-blur-sm">
-            <span
-              className="inline-block h-2 w-2 rounded-full"
-              style={{
-                backgroundColor:
-                  detection.confidence > 0.7
-                    ? "#22c55e"
-                    : detection.confidence > 0.5
-                    ? "#facc15"
-                    : "#ef4444",
-              }}
-            />
-            {(detection.confidence * 100).toFixed(0)}% detected
+    <div className="flex flex-col items-center gap-4 w-full">
+      {error && <div className="text-sm text-red-400 text-center">{error}</div>}
+      <div className="relative w-full overflow-hidden rounded-2xl bg-black" style={{ maxWidth: 400 }}>
+        {phase === "camera" && (
+          <div className="relative">
+            <video ref={videoRef} autoPlay playsInline muted className="h-full w-full object-cover" style={{ aspectRatio: "3/4" }} />
+            <canvas ref={overlayRef} className="pointer-events-none absolute inset-0 h-full w-full" />
+          </div>
+        )}
+        {phase === "preview" && capturedURL && (
+          <div className="relative">
+            <img src={capturedURL} className="w-full object-cover" style={{ aspectRatio: "3/4" }} alt={label} />
+            <div className="absolute top-3 left-3 bg-black/60 px-3 py-1 rounded-full text-xs text-white">{label}</div>
           </div>
         )}
       </div>
-
-      {/* Quality issues */}
-      <div className="mt-2.5 w-full max-w-[480px]">
-        <QualityIndicator
-          issues={detection?.issues ?? []}
-          localQuality={quality}
-        />
-      </div>
-
-      <p className="mt-3 text-center text-sm text-zinc-600 dark:text-zinc-400">
-        Place your ID within the frame and take a picture.
-      </p>
-
-      {/* Action buttons */}
-      <div className="mt-5 flex items-center gap-6">
-        <button
-          type="button"
-          onClick={() => fileInputRef.current?.click()}
-          className="flex h-12 w-12 items-center justify-center rounded-full bg-zinc-200 text-zinc-600 transition-colors hover:bg-zinc-300 dark:bg-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-600"
-          aria-label="Upload from gallery"
-        >
-          <ImagePlus className="h-5 w-5" />
-        </button>
-
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="image/*"
-          className="hidden"
-          onChange={handleGallerySelect}
-        />
-
-        <button
-          type="button"
-          onClick={handleManualCapture}
-          disabled={!isReady}
-          className="group relative flex h-[68px] w-[68px] items-center justify-center rounded-full border-[3px] border-blue-500 transition-all active:scale-95 disabled:opacity-40"
-          aria-label="Capture photo"
-        >
-          <span className="block h-[54px] w-[54px] rounded-full bg-blue-500 transition-colors group-hover:bg-blue-400 group-active:bg-blue-600" />
-
-          {holdProgress > 0 && holdProgress < 1 && (
-            <svg
-              className="absolute -inset-1 h-[76px] w-[76px]"
-              viewBox="0 0 76 76"
-            >
-              <circle
-                cx="38"
-                cy="38"
-                r="35"
-                fill="none"
-                stroke="#22c55e"
-                strokeWidth="3"
-                strokeLinecap="round"
-                strokeDasharray={`${holdProgress * 219.91} 219.91`}
-                transform="rotate(-90 38 38)"
-              />
-            </svg>
-          )}
-        </button>
-
-        <div className="h-12 w-12" />
-      </div>
-
-      {!isConnected && isReady && (
-        <p className="mt-2 text-xs text-yellow-500">
-          Connecting to detection server...
-        </p>
+      {phase === "camera" && (
+        <>
+          <p className="text-sm text-zinc-400">{cardDetected ? "Card detected — ready to capture" : "Position your ID card flat in the frame"}</p>
+          <button onClick={handleCapture} disabled={!cardDetected}
+            className={`w-full py-4 rounded-2xl text-white font-semibold text-lg transition-all ${cardDetected ? "bg-green-500 shadow-lg shadow-green-500/30 active:scale-95" : "bg-zinc-700 text-zinc-500 cursor-not-allowed"}`}>
+            <Camera className="mr-2 inline h-5 w-5" />{cardDetected ? "Capture Card" : "Waiting for card..."}
+          </button>
+        </>
+      )}
+      {phase === "preview" && (
+        <div className="flex flex-col gap-3 w-full">
+          <div className="flex gap-3">
+            <button onClick={handleRetake} className="flex-1 py-3 rounded-xl border border-zinc-600 text-zinc-300 text-sm">↩ Retake</button>
+            <button onClick={handleProceed} disabled={submitting} className="flex-1 py-3 rounded-xl bg-blue-600 text-white font-semibold text-sm">{submitting ? "Uploading..." : "Use this photo →"}</button>
+          </div>
+          {qualityWarn && <p className="text-yellow-400 text-xs text-center flex items-center justify-center gap-1"><AlertTriangle className="h-3 w-3" />{qualityWarn}</p>}
+        </div>
       )}
     </div>
   );
