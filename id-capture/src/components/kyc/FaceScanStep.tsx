@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { canvasToJpegBlob, grabFrame } from "@/lib/frameEncoder";
 import { API_BASE } from "@/lib/apiBase";
-import { useMediaPipeFace, serializeLandmarks } from "@/hooks/useMediaPipeFace";
+import { useMediaPipeFace } from "@/hooks/useMediaPipeFace";
 import { checkLiveness, prepareLivenessInput } from "@/lib/silentFaceLiveness";
 import clsx from "clsx";
 import { CheckCircle, Loader2, XCircle, Camera } from "lucide-react";
@@ -44,7 +44,7 @@ export default function FaceScanStep({
   const [statusText, setStatusText] = useState("");
   const [confidence, setConfidence] = useState(0);
 
-  const { landmarks, faceDetected, isReady, processFrame } =
+  const { landmarks, faceDetected, isReady, detect } =
     useMediaPipeFace();
 
   const cleanup = useCallback(() => {
@@ -202,8 +202,7 @@ export default function FaceScanStep({
         return;
       }
 
-      grabFrame(video, canvas);
-      processFrame(video, canvas);
+      detect(video, canvas);
       drawOverlay();
 
       animRef.current = requestAnimationFrame(loop);
