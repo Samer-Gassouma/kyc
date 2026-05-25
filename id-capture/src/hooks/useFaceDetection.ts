@@ -19,10 +19,11 @@ async function ensureModels(): Promise<void> {
   if (!_loading) {
     _loading = (async () => {
       const fa = await getFaceApi();
-      console.log("[face-api] Loading tiny face detector only...");
+      console.log("[face-api] Loading models...");
       await fa.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
+      await fa.nets.faceLandmark68TinyNet.loadFromUri(MODEL_URL);
       _loaded = true;
-      console.log("[face-api] Ready (bbox-only)");
+      console.log("[face-api] Ready (bbox + 68-tiny landmarks)");
     })();
   }
   return _loading;
@@ -34,16 +35,33 @@ export interface FaceBox {
 
 export type PoseState = "center" | "left" | "right" | "up" | "none";
 
-function detectPose(box: FaceBox, frameW: number, frameH: number): PoseState {
-  const cx = box.x + box.width / 2;
-  const cy = box.y + box.height / 2;
-  const nx = (cx - frameW / 2) / (frameW / 2);
-  const ny = (cy - frameH / 2) / (frameH / 2);
+/** Detect head pose from nose tip position RELATIVE to the face bounding box.
+ *
+ *  face-api processes the RAW (un-mirrored) camera frame.
+ *  In the raw image: person's LEFT  = right side of image
+ *                    person's RIGHT = left side of image
+ *
+ *  When turning head LEFT:  nose appears on the RIGHT side of the face box
+ *  When turning head RIGHT: nose appears on the LEFT side of the face box
+ *  When looking UP:         nose appears HIGHER in the face box
+ */
+function detectPose(box: FaceBox, noseTip: { x: number; y: number }): PoseState {
+  const boxCx = box.x + box.width / 2;
+  const boxCy = box.y + box.height / 2;
+  const bw = Math.max(box.width, 1);
+  const bh = Math.max(box.height, 1);
 
-  if (nx > 0.22) return "left";
-  if (nx < -0.22) return "right";
-  if (ny < -0.18) return "up";
-  if (Math.abs(nx) < 0.12 && Math.abs(ny) < 0.12) return "center";
+  const noseOffX = (noseTip.x - boxCx) / bw;
+  const noseOffY = (noseTip.y - boxCy) / bh;
+
+  // Nose on right side of face box (in raw image) = turned LEFT
+  if (noseOffX > 0.05) return "left";
+  // Nose on left side of face box = turned RIGHT
+  if (noseOffX < -0.045) return "right";
+  // Nose above box center = looking UP
+  if (noseOffY < -0.04) return "up";
+  // Nose roughly centered
+  if (Math.abs(noseOffX) < 0.035 && Math.abs(noseOffY) < 0.035) return "center";
   return "none";
 }
 
@@ -57,7 +75,9 @@ export function useFaceDetection() {
     ensureModels().then(() => setIsReady(true)).catch(e => console.error("[face-api] fail:", e));
   }, []);
 
-  async function detect(video: HTMLVideoElement): Promise<{ box: FaceBox; pose: PoseState } | null> {
+  async function detect(video: HTMLVideoElement): Promise<{
+    box: FaceBox; pose: PoseState; noseTip: { x: number; y: number };
+  } | null> {
     const fa = _faceapi;
     if (!fa || !_loaded) return null;
     const vw = video.videoWidth, vh = video.videoHeight;
@@ -67,17 +87,35 @@ export function useFaceDetection() {
       const result = await fa.detectSingleFace(
         video,
         new fa.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 })
-      );
-      // NO .withFaceLandmarks() — bounding box only, much faster
+      ).withFaceLandmarks();  // uses faceLandmark68TinyNet
 
-      if (!result) return null;
+      if (!result) {
+        (window as any).__pose = { pose: "none", reason: "no face detected" };
+        return null;
+      }
 
-      const raw = result.box; // { x, y, width, height }
+      const raw = result.box;
       const box: FaceBox = { x: raw.x, y: raw.y, width: raw.width, height: raw.height };
-      const pose = detectPose(box, vw, vh);
-      (window as any).__pose = { pose, box };
+      const nose = result.landmarks.getNose();
+      const noseTip = { x: nose[3].x, y: nose[3].y };
+      const boxCx = box.x + box.width / 2;
+      const boxCy = box.y + box.height / 2;
+      const noseOffX = (noseTip.x - boxCx) / Math.max(box.width, 1);
+      const noseOffY = (noseTip.y - boxCy) / Math.max(box.height, 1);
+      const pose = detectPose(box, noseTip);
 
-      return { box, pose };
+      // Heavy debug logging
+      if (Math.random() < 0.02) {
+        console.log(
+          `[Pose] box=(${box.x.toFixed(0)},${box.y.toFixed(0)} ${box.width.toFixed(0)}x${box.height.toFixed(0)}) ` +
+          `nose=(${noseTip.x.toFixed(0)},${noseTip.y.toFixed(0)}) ` +
+          `offX=${noseOffX.toFixed(3)} offY=${noseOffY.toFixed(3)} → ${pose}`
+        );
+      }
+
+      (window as any).__pose = { pose, box, noseTip, noseOffX: noseOffX.toFixed(3), noseOffY: noseOffY.toFixed(3) };
+
+      return { box, pose, noseTip };
     } catch {
       return null;
     }

@@ -128,10 +128,12 @@ export default function FacePage() {
 
         if (matches) {
           setStatusMsg(`${LABEL[target]} — hold still`);
-        } else if (res.pose === "none" && target !== "center") {
-          setStatusMsg(LABEL[target]);
-        } else if (!matches) {
-          setStatusMsg(LABEL[target]);
+        } else {
+          // Show live debug: nose position relative to box center
+          const dbg = (window as any).__pose;
+          const sx = dbg?.noseOffX != null ? ` noseOffX=${dbg.noseOffX}` : "";
+          const sy = dbg?.noseOffY != null ? ` noseOffY=${dbg.noseOffY}` : "";
+          setStatusMsg(`${LABEL[target]}${sx}${sy}`);
         }
 
         if (stableRef.current >= 30 && !capturedFrames.current.has(target)) {
