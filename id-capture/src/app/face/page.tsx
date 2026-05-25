@@ -161,7 +161,7 @@ export default function FacePage() {
     const canvas = document.createElement("canvas");
     const loop = () => {
       const video = videoRef.current;
-      if (!video || video.readyState < 2) {
+      if (!video || video.videoWidth === 0 || video.videoHeight === 0) {
         animRef.current = requestAnimationFrame(loop);
         return;
       }

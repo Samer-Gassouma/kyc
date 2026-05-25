@@ -12,7 +12,7 @@ interface UseMediaPipeFaceReturn {
   faceDetected: boolean;
   isReady: boolean;
   error: string | null;
-  processFrame: (video: HTMLVideoElement, canvas: HTMLCanvasElement) => void;
+  processFrame: (video: HTMLVideoElement, canvas: HTMLCanvasElement) => boolean;
 }
 
 let faceLandmarker: FaceLandmarker | null = null;
@@ -53,6 +53,9 @@ export function useMediaPipeFace(): UseMediaPipeFaceReturn {
   const [landmarks, setLandmarks] = useState<NormalizedLandmark[][] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const loadAttempted = useRef(false);
+  const frameCount = useRef(0);
+  const detectCount = useRef(0);
+  const missCount = useRef(0);
 
   useEffect(() => {
     if (loadAttempted.current) return;
@@ -67,21 +70,42 @@ export function useMediaPipeFace(): UseMediaPipeFaceReturn {
   }, []);
 
   const processFrame = useCallback(
-    (video: HTMLVideoElement, canvas: HTMLCanvasElement) => {
-      if (!faceLandmarker) return;
+    (video: HTMLVideoElement, canvas: HTMLCanvasElement): boolean => {
+      if (!faceLandmarker) return false;
+
+      frameCount.current++;
+      if (canvas.width === 0 || canvas.height === 0) return false;
 
       try {
-        // Use IMAGE mode — pass the canvas directly to detect()
         const results = faceLandmarker.detect(canvas);
         if (results.faceLandmarks && results.faceLandmarks.length > 0) {
+          detectCount.current++;
           setLandmarks(results.faceLandmarks);
           setFaceDetected(true);
+          // Log every 60 frames
+          if (detectCount.current % 60 === 1) {
+            console.log(
+              `[MediaPipe] Face detected (frame ${frameCount.current}, ` +
+              `hits=${detectCount.current}, misses=${missCount.current})`
+            );
+          }
+          return true;
         } else {
+          missCount.current++;
+          if (frameCount.current === 1 || frameCount.current % 120 === 0) {
+            console.log(
+              `[MediaPipe] No face (frame ${frameCount.current}, ` +
+              `canvas=${canvas.width}x${canvas.height}, ` +
+              `hits=${detectCount.current}, misses=${missCount.current})`
+            );
+          }
           setFaceDetected(false);
+          return false;
         }
       } catch (e) {
         console.error("[MediaPipe] detect error:", e);
         setFaceDetected(false);
+        return false;
       }
     },
     []

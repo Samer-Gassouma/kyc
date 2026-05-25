@@ -89,7 +89,7 @@ export default function FaceScanStep({
 
   // Transition to scanning when models + camera are ready
   useEffect(() => {
-    if (isReady && videoRef.current && scanState === "preparing") {
+    if (isReady && videoRef.current && videoRef.current.videoWidth > 0 && scanState === "preparing") {
       setScanState("scanning");
       setStatusText("Position your face in the frame");
     }
@@ -197,7 +197,7 @@ export default function FaceScanStep({
 
     const loop = () => {
       const video = videoRef.current;
-      if (!video || video.readyState < 2) {
+      if (!video || video.videoWidth === 0 || video.videoHeight === 0) {
         animRef.current = requestAnimationFrame(loop);
         return;
       }
