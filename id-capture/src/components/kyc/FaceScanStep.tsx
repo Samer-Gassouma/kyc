@@ -75,16 +75,30 @@ export default function FaceScanStep({ token, userId, onComplete }: FaceScanStep
   }, [state]);
 
   async function doCapture(video:HTMLVideoElement) {
-    setState("verifying"); setMsg("Verifying...");
+    setState("verifying");
     const c=document.createElement("canvas"); grabFrame(video,c);
     const blob=await canvasToJpegBlob(c,0.85);
     try {
-      const fd=new FormData(); fd.append("image",blob,"face.jpg"); fd.append("user_id",userId);
-      const res=await fetch(`${API_BASE}/api/face/verify`,{method:"POST",headers:{Authorization:`Bearer ${token}`},body:fd});
-      if(!res.ok) throw new Error((await res.json().catch(()=>({}))).detail||`HTTP ${res.status}`);
-      const d=await res.json(); setConfidence(d.confidence);
-      if(d.matched){setState("passed");onC.current({passed:true,confidence:d.confidence,user_id:d.user_id,liveBlob:blob});}
-      else{setState("failed");setError(`No match (${(d.confidence*100).toFixed(0)}%)`);}
+      if (userId) {
+        // Verify against existing identity
+        setMsg("Verifying...");
+        const fd=new FormData(); fd.append("image",blob,"face.jpg"); fd.append("user_id",userId);
+        const res=await fetch(`${API_BASE}/api/face/verify`,{method:"POST",headers:{Authorization:`Bearer ${token}`},body:fd});
+        if(!res.ok) throw new Error((await res.json().catch(()=>({}))).detail||`HTTP ${res.status}`);
+        const d=await res.json(); setConfidence(d.confidence);
+        if(d.matched){setState("passed");onC.current({passed:true,confidence:d.confidence,user_id:d.user_id,liveBlob:blob});}
+        else{setState("failed");setError(`No match (${(d.confidence*100).toFixed(0)}%)`);}
+      } else {
+        // No userId — enroll as new identity
+        setMsg("Enrolling...");
+        const fd=new FormData(); fd.append("image",blob,"face.jpg"); fd.append("liveness_score","1.0");
+        const res=await fetch(`${API_BASE}/api/face/enroll`,{method:"POST",headers:{Authorization:`Bearer ${token}`},body:fd});
+        if(!res.ok) throw new Error((await res.json().catch(()=>({}))).detail||`HTTP ${res.status}`);
+        const d=await res.json();
+        setConfidence(1.0);
+        setState("passed");
+        onC.current({passed:true,confidence:1.0,user_id:d.user_id,liveBlob:blob});
+      }
     } catch(e) { setState("failed"); setError(e instanceof Error?e.message:"Verification failed"); }
   }
 
