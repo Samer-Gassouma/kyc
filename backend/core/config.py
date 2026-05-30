@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     # ── Encryption ─────────────────────────────────────────────────
     aes_encryption_key: str = "0123456789abcdef0123456789abcdef"
 
+    # ── Debug ───────────────────────────────────────────────────────
+    debug: bool = False
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 

@@ -9,7 +9,7 @@ from core.db import init_db
 from core.pg_db import init_pg_db
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routers import auth, capture, extract, face, gallery, stream
+from routers import auth, capture, extract, face, gallery, kyc, stream
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -40,6 +40,7 @@ app.include_router(stream.router)
 app.include_router(capture.router)
 app.include_router(extract.router)
 app.include_router(gallery.router)
+app.include_router(kyc.router)
 
 
 @app.on_event("startup")
