@@ -15,3 +15,4 @@ __pycache__/
 # Runtime data
 backend/selfies/
 backend/logs/
+test_data/
