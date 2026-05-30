@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState, useEffect, useCallback } from "react";
+import { useRef, useState, useEffect } from "react";
 import { useKYCStore } from "@/store/kycStore";
 import { useFaceDetection } from "@/hooks/useFaceDetection";
 import { API_BASE } from "@/lib/apiBase";
@@ -19,7 +19,7 @@ export default function LivenessScreen() {
   const [cameraReady, setCameraReady] = useState(false);
   const [progress, setProgress] = useState(0);
   const [blinkDetected, setBlinkDetected] = useState(false);
-  const [message, setMessage] = useState("Loading...");
+  const [instruction, setInstruction] = useState("Loading...");
 
   // Start camera
   useEffect(() => {
@@ -35,9 +35,9 @@ export default function LivenessScreen() {
         const v = videoRef.current;
         if (v) { v.srcObject = stream; await v.play(); }
         setCameraReady(true);
-        setMessage("Move your head slowly to complete the circle");
+        setInstruction("Center your face in the circle");
       } catch {
-        setMessage("Camera access denied");
+        setInstruction("Camera access denied");
       }
     })();
     return () => {
@@ -47,7 +47,7 @@ export default function LivenessScreen() {
     };
   }, []);
 
-  // Face detection loop
+  // ── Frame loop ──────────────────────────────────────────────────────
   useEffect(() => {
     if (!cameraReady || !isReady) return;
     let running = true;
@@ -61,37 +61,75 @@ export default function LivenessScreen() {
         return;
       }
 
+      const canvasW = v.videoWidth;
+      const canvasH = v.videoHeight;
+      c.width  = canvasW;
+      c.height = canvasH;
+
+      const ctx = c.getContext("2d");
+      if (!ctx) { animRef.current = requestAnimationFrame(loop); return; }
+
       const result = detect(v, c);
       if (!running) return;
 
+      ctx.clearRect(0, 0, canvasW, canvasH);
+
+      // ── Fixed ring geometry — never moves ──────────────────────────
+      const ringCenterX = canvasW / 2;
+      const ringCenterY = canvasH / 2;
+      const ringRadius  = Math.min(canvasW, canvasH) * 0.38;
+
+      let instructionText = "Center your face in the circle";
+      let currentProgress = progress;
+      let currentBlink = blinkDetected;
+
       if (result.faceDetected && result.landmarks[0]) {
-        const box = faceBbox(result.landmarks[0], v.videoWidth, v.videoHeight);
-        const cx = box.x + box.width / 2;
-        const cy = box.y + box.height / 2;
+        const box = faceBbox(result.landmarks[0], canvasW, canvasH);
 
-        positionHistory.current.push({ x: cx, y: cy });
-        if (positionHistory.current.length > 90) positionHistory.current.shift();
+        // Face center normalized to canvas (0..1)
+        const faceCx = (box.x + box.width  / 2) / canvasW;
+        const faceCy = (box.y + box.height / 2) / canvasH;
 
-        // Compute progress: how many of 12 angular sectors have been covered
-        if (positionHistory.current.length > 5) {
-          const center = {
-            x: positionHistory.current.reduce((s, p) => s + p.x, 0) / positionHistory.current.length,
-            y: positionHistory.current.reduce((s, p) => s + p.y, 0) / positionHistory.current.length,
-          };
+        // Check if face is roughly centered
+        const faceOffsetX = Math.abs(faceCx - 0.5);
+        const faceOffsetY = Math.abs(faceCy - 0.5);
+        const faceInPosition = faceOffsetX < 0.22 && faceOffsetY < 0.22;
 
-          const covered = new Set<number>();
-          positionHistory.current.forEach((p) => {
-            const angle = Math.atan2(p.y - center.y, p.x - center.x);
-            const sector = Math.floor(((angle + Math.PI) / (Math.PI * 2)) * 12);
-            covered.add(sector);
-          });
+        if (faceInPosition) {
+          // Accumulate position history (normalized coords)
+          positionHistory.current.push({ x: faceCx, y: faceCy });
+          if (positionHistory.current.length > 90) positionHistory.current.shift();
 
-          const p = Math.min(covered.size / 12, 1.0);
-          setProgress(p);
+          // Compute angular coverage from average center
+          if (positionHistory.current.length > 10) {
+            const avgX = positionHistory.current.reduce((s, p) => s + p.x, 0) / positionHistory.current.length;
+            const avgY = positionHistory.current.reduce((s, p) => s + p.y, 0) / positionHistory.current.length;
+
+            const covered = new Set<number>();
+            for (const p of positionHistory.current) {
+              const dx = p.x - avgX;
+              const dy = p.y - avgY;
+              const dist = Math.sqrt(dx * dx + dy * dy);
+              if (dist < 0.015) continue; // ignore micro-movements
+              const angle = Math.atan2(dy, dx);
+              const sector = Math.floor(((angle + Math.PI) / (Math.PI * 2)) * 12);
+              covered.add(sector);
+            }
+            currentProgress = Math.min(covered.size / 12, 1.0);
+            setProgress(currentProgress);
+          }
+
+          instructionText = currentProgress >= 1
+            ? currentBlink ? "✓ Liveness confirmed" : "Now blink naturally"
+            : "Move your head slowly to complete the circle";
+
+        } else {
+          // Don't accumulate — face not centered
+          instructionText = "Center your face in the circle";
         }
 
-        // Blink detection
-        if (result.blendshapes) {
+        // ── Blink detection ──────────────────────────────────────────
+        if (result.blendshapes && faceInPosition) {
           const blinkL = result.blendshapes.find(
             (b: any) => b.categoryName === "eyeBlinkLeft"
           )?.score ?? 0;
@@ -103,26 +141,49 @@ export default function LivenessScreen() {
             eyeClosed.current = true;
           }
           if (blinkL < 0.1 && blinkR < 0.1 && eyeClosed.current) {
+            currentBlink = true;
             setBlinkDetected(true);
             eyeClosed.current = false;
+            if (currentProgress >= 1) {
+              instructionText = "✓ Liveness confirmed";
+            }
           }
         }
-
-        // Update message
-        if (progress < 1) {
-          setMessage("Move your head slowly to complete the circle");
-        } else if (!blinkDetected) {
-          setMessage("Now blink naturally");
-        } else {
-          setMessage("✓ Liveness confirmed");
-        }
-
-        // Draw ring
-        drawLivenessRing(c, cx, cy, Math.min(box.width, box.height) * 0.55, progress, blinkDetected);
       } else {
-        setMessage("No face detected");
-        const ctx = c.getContext("2d");
-        if (ctx) ctx.clearRect(0, 0, c.width, c.height);
+        instructionText = "No face detected";
+        setProgress(0);
+        positionHistory.current = [];
+      }
+
+      setInstruction(instructionText);
+
+      // ── Draw everything ────────────────────────────────────────────
+
+      // 1. Static guide circle
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(ringCenterX, ringCenterY, ringRadius - 16, 0, Math.PI * 2);
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.12)";
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([6, 6]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+
+      // 2. Tick ring (always fixed at center)
+      drawLivenessRing(ctx, ringCenterX, ringCenterY, ringRadius, currentProgress);
+
+      // 3. Blink indicator dot
+      if (currentBlink && currentProgress >= 1) {
+        ctx.beginPath();
+        ctx.arc(ringCenterX, ringCenterY - ringRadius - 20, 8, 0, Math.PI * 2);
+        ctx.fillStyle = "#22c55e";
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(ringCenterX, ringCenterY - ringRadius - 20, 8, 0, Math.PI * 2);
+        ctx.strokeStyle = "#22c55e";
+        ctx.lineWidth = 2;
+        ctx.stroke();
       }
 
       animRef.current = requestAnimationFrame(loop);
@@ -132,7 +193,7 @@ export default function LivenessScreen() {
     return () => { running = false; };
   }, [cameraReady, isReady, progress, blinkDetected, detect]);
 
-  // Complete when both conditions met
+  // ── Complete when both conditions met ───────────────────────────────
   useEffect(() => {
     if (progress >= 1.0 && blinkDetected) {
       const timeout = setTimeout(async () => {
@@ -147,7 +208,7 @@ export default function LivenessScreen() {
           });
         } catch {}
         setStep("PHONE_INPUT");
-      }, 800);
+      }, 1000);
       return () => clearTimeout(timeout);
     }
   }, [progress, blinkDetected, sessionId, setLivenessScore, setStep]);
@@ -156,40 +217,51 @@ export default function LivenessScreen() {
     <div className="space-y-4">
       <h2 className="text-xl font-bold text-white text-center">Liveness Check</h2>
       <p className="text-zinc-400 text-sm text-center">
-        Move your head in a circle, then blink to prove you&apos;re real
+        Center your face in the circle, then move your head around and blink
       </p>
 
-      <div className="relative w-full aspect-square rounded-xl overflow-hidden bg-black">
+      <div className="relative w-full aspect-square rounded-2xl overflow-hidden bg-black">
+        {/* Video — mirrored */}
         <video
           ref={videoRef}
-          className="w-full h-full object-cover"
+          className="absolute inset-0 w-full h-full object-cover"
           style={{ transform: "scaleX(-1)" }}
           autoPlay
           muted
           playsInline
         />
+
+        {/* Canvas overlay — matches video mirroring */}
         <canvas
           ref={canvasRef}
           className="absolute inset-0 w-full h-full"
           style={{ transform: "scaleX(-1)" }}
         />
 
+        {/* Dark gradient vignette over edges */}
+        <div className="absolute inset-0 pointer-events-none rounded-2xl"
+          style={{
+            boxShadow: "inset 0 0 80px 40px rgba(0,0,0,0.6)",
+          }}
+        />
+
         {!cameraReady && (
           <div className="absolute inset-0 flex flex-col items-center justify-center">
-            <div className="w-48 h-48 rounded-full border-4 border-dashed border-zinc-600 animate-spin flex items-center justify-center"
-                 style={{ animationDuration: "3s" }}>
-              <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#888" strokeWidth="1.5">
-                <circle cx="12" cy="8" r="4" />
-                <path d="M4 20c0-4 3.6-7 8-7s8 3 8 7" />
-              </svg>
-            </div>
+            <div className="w-16 h-16 rounded-full border-4 border-dashed border-zinc-500 animate-spin"
+                 style={{ animationDuration: "3s" }} />
           </div>
         )}
 
         {cameraReady && (
-          <div className="absolute bottom-4 left-0 right-0 flex justify-center">
-            <span className="bg-black/70 text-white px-4 py-2 rounded-full text-sm">
-              {message}
+          <div className="absolute bottom-6 left-0 right-0 flex justify-center z-10">
+            <span className={`px-5 py-2.5 rounded-full text-sm font-medium backdrop-blur-md transition-colors duration-300 ${
+              instruction.includes("✓")
+                ? "bg-green-500/80 text-white"
+                : instruction.includes("Center")
+                  ? "bg-white/10 text-white/80"
+                  : "bg-black/60 text-white"
+            }`}>
+              {instruction}
             </span>
           </div>
         )}
@@ -210,19 +282,12 @@ function faceBbox(pts: any[], vw: number, vh: number) {
 }
 
 function drawLivenessRing(
-  canvas: HTMLCanvasElement,
+  ctx: CanvasRenderingContext2D,
   cx: number,
   cy: number,
   radius: number,
-  progress: number,
-  blinkDone: boolean
+  progress: number
 ) {
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return;
-
-  canvas.width = canvas.clientWidth;
-  canvas.height = canvas.clientHeight;
-
   const TICKS = 60;
   const filled = Math.floor(progress * TICKS);
 
@@ -239,27 +304,8 @@ function drawLivenessRing(
     ctx.moveTo(x1, y1);
     ctx.lineTo(x2, y2);
     ctx.lineWidth = 3;
-    ctx.strokeStyle = i < filled ? "#22c55e" : "rgba(255,255,255,0.25)";
+    ctx.strokeStyle = i < filled ? "#22c55e" : "rgba(255,255,255,0.20)";
     ctx.lineCap = "round";
     ctx.stroke();
-  }
-
-  // Circular clip mask for face
-  ctx.save();
-  ctx.beginPath();
-  ctx.arc(cx, cy, radius - 16, 0, Math.PI * 2);
-  ctx.clip();
-
-  // Draw video frame inside circle
-  ctx.globalCompositeOperation = "source-over";
-
-  ctx.restore();
-
-  // Blink indicator dot
-  if (blinkDone && progress >= 1) {
-    ctx.beginPath();
-    ctx.arc(cx, cy - radius - 20, 6, 0, Math.PI * 2);
-    ctx.fillStyle = "#22c55e";
-    ctx.fill();
   }
 }
