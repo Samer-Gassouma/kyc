@@ -12,7 +12,7 @@ const LIVENESS_STEPS = [
   { id: "right", label: "← Turn your head RIGHT", ringEnd: 1.00 },
 ] as const;
 
-const HOLD_REQUIRED = 30; // frames at ~30fps = ~1 second
+const HOLD_REQUIRED = 20; // frames at ~30fps = ~0.7 seconds
 
 // ── Direction detection — bounding box only ───────────────────────────
 
@@ -27,13 +27,13 @@ function detectDirection(
   const ny = faceCy / canvasH;
 
   // Front camera is mirrored:
-  // user turns LEFT  → face appears on RIGHT  side of frame → nx > 0.55
-  // user turns RIGHT → face appears on LEFT   side of frame → nx < 0.45
-  // user looks UP    → face moves UP in frame               → ny < 0.38
-  if (nx > 0.58) return "left";
-  if (nx < 0.42) return "right";
-  if (ny < 0.38) return "up";
-  if (Math.abs(nx - 0.5) < 0.12 && Math.abs(ny - 0.5) < 0.14) return "center";
+  // user turns LEFT  → face appears on RIGHT  side of frame → nx > 0.5
+  // user turns RIGHT → face appears on LEFT   side of frame → nx < 0.5
+  // user looks UP    → face moves UP in frame               → ny < 0.5
+  if (nx > 0.54) return "left";
+  if (nx < 0.46) return "right";
+  if (ny < 0.44) return "up";
+  if (Math.abs(nx - 0.5) < 0.15 && Math.abs(ny - 0.5) < 0.18) return "center";
   return "none";
 }
 
