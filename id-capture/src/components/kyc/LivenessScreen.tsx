@@ -8,10 +8,8 @@ import { API_BASE } from "@/lib/apiBase";
 // ── Step definitions ──────────────────────────────────────────────────
 
 const LIVENESS_STEPS = [
-  { id: "left",  label: "Turn your head LEFT  →", ringEnd: 0.25 },
-  { id: "right", label: "← Turn your head RIGHT", ringEnd: 0.50 },
-  { id: "up",    label: "Tilt your head UP  ↑",   ringEnd: 0.75 },
-  { id: "blink", label: "Now blink naturally 👁",  ringEnd: 1.00 },
+  { id: "left",  label: "Turn your head LEFT  →", ringEnd: 0.50 },
+  { id: "right", label: "← Turn your head RIGHT", ringEnd: 1.00 },
 ] as const;
 
 const HOLD_REQUIRED = 30; // frames at ~30fps = ~1 second
@@ -50,7 +48,6 @@ export default function LivenessScreen() {
   const streamRef = useRef<MediaStream | null>(null);
   const animRef = useRef(0);
   const holdFrames = useRef(0);
-  const eyeClosed = useRef(false);
   const completedRef = useRef(false);
 
   const [cameraReady, setCameraReady] = useState(false);
@@ -123,60 +120,36 @@ export default function LivenessScreen() {
         const box = faceBbox(result.landmarks[0], canvasW, canvasH);
         const currentStep = LIVENESS_STEPS[currentStepIndex];
 
-        // ── Blink step ─────────────────────────────────────────────────
-        if (currentStep.id === "blink") {
-          if (result.blendshapes) {
-            const blinkL = result.blendshapes.find(
-              (b: any) => b.categoryName === "eyeBlinkLeft"
-            )?.score ?? 0;
-            const blinkR = result.blendshapes.find(
-              (b: any) => b.categoryName === "eyeBlinkRight"
-            )?.score ?? 0;
+        // ── Direction step ────────────────────────────────────────────
+        const direction = detectDirection(box, canvasW, canvasH);
+        const stepStart = currentStepIndex * 0.5;
 
-            if (blinkL > 0.35 || blinkR > 0.35) {
-              // Blink confirmed — complete liveness
-              setRingProgress(1.0);
-              setCurrentStepIndex(4);
+        if (direction === currentStep.id) {
+          holdFrames.current += 1;
+
+          // Animate ring smoothly during hold
+          const holdFraction = Math.min(holdFrames.current / HOLD_REQUIRED, 1.0);
+          const prog = stepStart + holdFraction * 0.5;
+          setRingProgress(prog);
+
+          if (holdFrames.current >= HOLD_REQUIRED) {
+            // Step complete — advance to next
+            holdFrames.current = 0;
+            const nextIdx = currentStepIndex + 1;
+            setRingProgress(currentStep.ringEnd);
+            setCurrentStepIndex(nextIdx);
+            if (nextIdx >= LIVENESS_STEPS.length) {
               completedRef.current = true;
               handleComplete();
               running = false;
               return;
             }
           }
-          // animate toward 1.0 to show user we're waiting for a blink
-          setRingProgress(0.75 + 0.25 * 0.3); // holds at ~82% while waiting for blink
         } else {
-          // ── Direction step ────────────────────────────────────────────
-          const direction = detectDirection(box, canvasW, canvasH);
-          const stepStart = currentStepIndex * 0.25;
-
-          if (direction === currentStep.id) {
-            holdFrames.current += 1;
-
-            // Animate ring smoothly during hold
-            const holdFraction = Math.min(holdFrames.current / HOLD_REQUIRED, 1.0);
-            const prog = stepStart + holdFraction * 0.25;
-            setRingProgress(prog);
-
-            if (holdFrames.current >= HOLD_REQUIRED) {
-              // Step complete — advance to next
-              holdFrames.current = 0;
-              const nextIdx = currentStepIndex + 1;
-              setRingProgress(currentStep.ringEnd);
-              setCurrentStepIndex(nextIdx);
-              if (nextIdx >= LIVENESS_STEPS.length) {
-                completedRef.current = true;
-                handleComplete();
-                running = false;
-                return;
-              }
-            }
-          } else {
-            // Wrong direction — decay hold progress slowly
-            holdFrames.current = Math.max(0, holdFrames.current - 2);
-            const holdFraction = holdFrames.current / HOLD_REQUIRED;
-            setRingProgress(stepStart + holdFraction * 0.25);
-          }
+          // Wrong direction — decay hold progress slowly
+          holdFrames.current = Math.max(0, holdFrames.current - 2);
+          const holdFraction = holdFrames.current / HOLD_REQUIRED;
+          setRingProgress(stepStart + holdFraction * 0.5);
         }
       }
 
@@ -335,7 +308,7 @@ function drawLivenessRing(
 ) {
   const TICKS = 60;
   const filled = Math.floor(progress * TICKS);
-  const quarterTicks = 15; // 60 / 4
+  const quarterTicks = 30; // 60 / 2 steps
 
   for (let i = 0; i < TICKS; i++) {
     const angle = (i / TICKS) * Math.PI * 2 - Math.PI / 2;
